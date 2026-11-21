@@ -525,6 +525,7 @@ function newContext(opts) {
     enableParent: new Map(), // refKey -> [parentKey, opposite]
     baseInfo: new Map(),    // baseKey -> {t, edid, model}
     ltex: new Map(),        // ltexKey -> {edid, txst, grass: [grasKey]}
+    cellRawVers: new Map(), worldRawVers: new Map(),   // every CELL / WRLD record version, for patches made for some mods only
     weathers: new Map(),    // wthrKey -> {edid, colors[type][time] = [r,g,b], fog:[dayNear,dayFar,nightNear,nightFar], flags}
     climates: new Map(),    // clmtKey -> {edid, weathers:[{key, chance}], times:[sunriseBegin, sunriseEnd, sunsetBegin, sunsetEnd] (hours)}
     gras: new Map(),        // grasKey -> {model, bounds, density, minSlope, maxSlope, water, waterType, posRange, heightRange, flags}
@@ -547,6 +548,8 @@ function isBaselineName(ctx, lname) {
   return false;
 }
 /** Global key of a raw FormID as read inside plugin p. */
+// every version of a cell / worldspace record, in load order (a patch for some mods only takes theirs)
+function verPush(map, key, v) { let a = map.get(key); if (!a) map.set(key, a = []); a.push(v); }
 function resolve(p, raw) {
   const mi = raw >>> 24;
   const owner = mi < p.masterG.length ? p.masterG[mi] : p.selfG;
@@ -726,7 +729,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
       return;
     }
     if (type === TY.CELL) {
-      if (world != null && !inBlock) ctx.cellRaw.set(resolve(p, raw), { p: p.idx, data: u8.slice(off, off + 24 + size), pers: true });   // the world's persistent cell: only kept for patches
+      if (world != null && !inBlock) { const v = { p: p.idx, data: u8.slice(off, off + 24 + size), pers: true }; ctx.cellRaw.set(resolve(p, raw), v); verPush(ctx.cellRawVers, resolve(p, raw), v); }   // the world's persistent cell: only kept for patches
       if (world == null || !inBlock) return; // skip the world's persistent cell
       const key = resolve(p, raw);
       const b = recordBody(u8, dv, off, size, flags);
@@ -739,7 +742,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
         else if (t === TY.EDID) edid = zstr(b.u8, o, o + l);
       });
       if (cx === null) return; // persistent world cell or interior
-      ctx.cellRaw.set(key, { p: p.idx, data: u8.slice(off, off + 24 + size) });   // the winning record, copied as-is into a seam patch
+      { const v = { p: p.idx, data: u8.slice(off, off + 24 + size) }; ctx.cellRaw.set(key, v); verPush(ctx.cellRawVers, key, v); }   // the winning record, copied as-is into a seam patch
       if (!ctx.cellInfo.has(key)) ctx.cellInfo.set(key, { world, x: cx, y: cy, edid, loc });
       else { const ci = ctx.cellInfo.get(key); if (edid) ci.edid = edid; ci.loc = loc; }
       const hasWater = !!(dflags & 2);
@@ -762,7 +765,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
         else if (t === TY.CNAM && l >= 4) w.climate = resolve(p, b.dv.getUint32(o, true));
       });
       ctx.worlds.set(key, w);
-      ctx.worldRaw.set(key, { p: p.idx, data: u8.slice(off, off + 24 + size) });
+      { const v = { p: p.idx, data: u8.slice(off, off + 24 + size) }; ctx.worldRaw.set(key, v); verPush(ctx.worldRawVers, key, v); }
       return;
     }
     if (type === TY.WTHR) {
@@ -1716,6 +1719,7 @@ function patchWriter(ctx, seed) {
   const XCLR = T('XCLR'), RNAM = T('RNAM');
   // a record copied from its winning plugin: same content, form IDs rewritten for this patch's master list
   const copyRec = (raw, single) => {
+    if (!raw || !raw.data) throw new Error("copyRec got " + JSON.stringify(raw && Object.keys(raw)));
     const P = ctx.plugins[raw.p], u8 = raw.data, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     const type = dv.getUint32(0, true), size = dv.getUint32(4, true), flags = dv.getUint32(8, true), b = recordBody(u8, dv, 0, size, flags), parts = [];
     forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
@@ -2537,6 +2541,11 @@ async function buildNavPatch(ctx, W, plan, readRec) {
   // The other side of a border keeps its links: they are that other mod's problem, and its own patch fixes them.
   const allowed = p => !plan.only || plan.only.has(p) || (ctx.plugins[p] && ctx.plugins[p].baseline);
   let held = 0;
+  // the plugins such a patch may name as masters: the picked mods, the game's own files, and their masters
+  const okNames = new Set();
+  if (plan.only) { const add = nm => { const l = nm.toLowerCase(); if (okNames.has(l)) return; okNames.add(l); const P = ctx.plugins.find(q => q.lname === l); if (P) P.masters.forEach(add); }; ctx.plugins.forEach(P => { if (allowed(P.idx)) add(P.name); }); }
+  // cell / worldspace record to wrap the navmeshes in: the winner, or for a patch for some mods, the last version from those mods or the game
+  const pickVer = (vers, win) => { if (!plan.only) return win; const a = vers && vers.filter(v => allowed(v.p)); return a && a.length ? a[a.length - 1] : null; };
   for (const m of mods.values()) {
     const E = m.E ? eFinish(m.E) : null; if (!E && !m.z) continue;
     if (!allowed(m.e.p)) { held++; continue; }
@@ -2566,6 +2575,7 @@ async function buildNavPatch(ctx, W, plan, readRec) {
     ready.push({ j, P, body, N, flags, rawId: dv.getUint32(12, true), tail: u8.slice(16, 24), subs, extra: f.extra });
   }
   const count = { restored: 0, relinked: 0, fixed: 0, added: 0, cut: 0, snapped: 0, navs: 0, held };
+  let dirty = false;
   const write = (seed, check) => {
     const Wr = patchWriter(ctx, seed), { cat, sub, rec, grup, copyRec, keyId, lab } = Wr;
     const worlds = new Map(), ints = new Map(); let n = 0;
@@ -2577,12 +2587,17 @@ async function buildNavPatch(ctx, W, plan, readRec) {
       if (r.extra && check && ![...r.P.masters, r.P.name].every((m, i) => Wr.peek(m) === i)) { r.bad = true; skipped.push({ key: r.j.key, why: 'it holds extra data that cannot be carried into one patch with the others' }); continue; }
       const nv = nvnmBuild(Wr, r.P, r.body, r.N, { z: r.j.z, E: r.j.E, flat: !!r.j.sink, cellKey: r.j.world != null ? r.j.cell : null });
       if (check) { const c = nvnmParse(nv, 0, nv.length); if (!c.inv || c.nV !== r.N.nV || c.nT !== r.N.nT) { r.bad = true; skipped.push({ key: r.j.key, why: 'the rewritten navmesh did not pass its own check' }); continue; } }
+      const before = Wr.masters.length;
       const out = rec(TY.NAVM, r.flags & ~(FLAG_COMPRESSED | FLAG_DELETED), Wr.remap(r.P, r.rawId), r.tail, cat(r.subs.map(x => x ? sub(x.t, x.d) : sub(NVNM_T, nv))));
+      if (plan.only) {      // it points at something from a mod that was not picked (a navmesh that mod added, for example): left for that mod's patch
+        const cv = r.j.world != null ? pickVer(ctx.cellRawVers.get(r.j.cell), ctx.cellRaw.get(r.j.cell)) : true, wv = r.j.world != null ? pickVer(ctx.worldRawVers.get(r.j.world), ctx.worldRaw.get(r.j.world)) : true;
+        if (!cv || !wv || Wr.masters.slice(before).some(m => !okNames.has(m.toLowerCase()))) { r.bad = true; r.held = true; dirty = true; continue; }
+      }
       let map = ints; if (r.j.world != null) { map = worlds.get(r.j.world); if (!map) worlds.set(r.j.world, map = new Map()); }
       let c = map.get(r.j.cell); if (!c) map.set(r.j.cell, c = { p: [], t: [] });
       (r.j.pers ? c.p : c.t).push(out); n++;
     }
-    const cellGroup = (ck, c, raw) => { const cid = keyId(ck); return [copyRec(raw, Wr.CELL_F), grup(cid, 6, [...(c.p.length ? [grup(cid, 8, c.p)] : []), ...(c.t.length ? [grup(cid, 9, c.t)] : [])])]; };
+    const cellGroup = (ck, c, raw) => { const cid = keyId(ck); if (plan.only) raw = pickVer(ctx.cellRawVers.get(ck), raw); return [copyRec(raw, Wr.CELL_F), grup(cid, 6, [...(c.p.length ? [grup(cid, 8, c.p)] : []), ...(c.t.length ? [grup(cid, 9, c.t)] : [])])]; };
     const tops = [];
     if (ints.size) {      // interior cells sit in the numbered blocks their own plugin files use
       const blocks = new Map();
@@ -2599,14 +2614,15 @@ async function buildNavPatch(ctx, W, plan, readRec) {
           let sb = bl.get(sk); if (!sb) bl.set(sk, sb = []);
           sb.push([ck, c]);
         }
-        wparts.push(copyRec(ctx.worldRaw.get(wk), Wr.WRLD_F), grup(keyId(wk), 1, [...blocks].map(([bk, bl]) => grup(lab(...bk.split(',').map(Number)), 4, [...bl].map(([sk, list]) => grup(lab(...sk.split(',').map(Number)), 5, list.flatMap(([ck, c]) => cellGroup(ck, c, ctx.cellRaw.get(ck)))))))));
+        wparts.push(copyRec(pickVer(ctx.worldRawVers.get(wk), ctx.worldRaw.get(wk)), Wr.WRLD_F), grup(keyId(wk), 1, [...blocks].map(([bk, bl]) => grup(lab(...bk.split(',').map(Number)), 4, [...bl].map(([sk, list]) => grup(lab(...sk.split(',').map(Number)), 5, list.flatMap(([ck, c]) => cellGroup(ck, c, ctx.cellRaw.get(ck)))))))));
       }
       tops.push(grup(T('WRLD'), 0, wparts));
     }
     const head = Wr.tes4(`Navmesh patch from Terrain Inspector: ${n} navmesh(es) restored or corrected. Load after the plugins that touch them. Make it again if your load order changes.`);
     return { bytes: cat([head, ...tops]), masters: Wr.masters, n };
   };
-  const first = write([], false);
+  let first; for (let k = 0; k < 20; k++) { dirty = false; first = write([], false); if (!dirty) break; }     // again without the navmeshes held back, until none is
+  count.held += ready.filter(r => r.held).length;
   if (!first.n) return { bytes: null, count, skipped, cal };
   const loadIdx = new Map(ctx.plugins.map(P => [P.lname, P.idx])), at = m => loadIdx.has(m.toLowerCase()) ? loadIdx.get(m.toLowerCase()) : -1;
   const order = first.masters.slice().sort((a, b) => at(a) - at(b));
@@ -7051,7 +7067,7 @@ async function makeNavPatch() {
       c.relinked && `${c.relinked} navmesh${c.relinked > 1 ? 'es' : ''} re-linked (${[c.fixed && c.fixed + ' links corrected', c.added && c.added + ' added', c.cut && c.cut + (c.cut > 1 ? ' dead ones cut' : ' dead one cut')].filter(Boolean).join(', ')})`,
       c.snapped && `${c.snapped} put back on the ground`].filter(Boolean).join('; ');
     h = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${did}${r.skipped.length ? `. ${r.skipped.length} left out (${esc(why)})` : ''}${c.held ? `. ${c.held} neighbouring navmesh${c.held > 1 ? 'es' : ''} from mods you did not pick ${c.held > 1 ? 'were' : 'was'} left as ${c.held > 1 ? 'they are' : 'it is'}: their side gets fixed in their own patch` : ''}.
-      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(F.mods ? [...F.mods, ...S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)].sort((a, b) => b - a).map(i => P(i).name)[0] : r.after)}</b> (the last plugin ${F.mods ? 'you picked, or that touches these navmeshes' : 'that touches these navmeshes'}). ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
+      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li>${F.mods ? `<li>Put it <b>right after ${esc([...F.mods, ...S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)].sort((a, b) => b - a).map(i => P(i).name)[0])}</b>, <b>not at the end</b>: it only depends on the mods you picked and the game, and holds their cells as those mods left them, so your later mods' cell changes (water, lighting…) must still load after it.` : `<li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes).`} ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
       <div class="muted" style="margin-top:6px">This is the tool's newest and least proven kind of patch. Go to one of these places in game and watch an NPC or follower walk there before you keep it. Removing the plugin undoes everything. Make a new one when your load order changes.</div></div>`;
   }
   S.navMsg = { w: W, h };
