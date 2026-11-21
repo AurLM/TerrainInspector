@@ -210,7 +210,7 @@ details.paste{margin-top:10px}details.paste summary{cursor:pointer;color:var(--d
 .v3-welcome .w-end{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding-top:12px;border-top:1px solid #2c313c;font-size:13.5px}
 .v3-welcome .w-ok{font-size:14.5px;padding:8px 20px}
 .reopen{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;margin:0 0 14px;padding-bottom:14px;border-bottom:1px solid #2c313c;font-size:12.5px}
-.patchbox{margin:0 0 10px}.navmods{margin-top:8px;font-size:12.5px}.navmods summary{cursor:pointer;color:#cfd6e4}.navmodlist{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto;margin:4px 0 6px;padding:4px 6px;background:#1a1e26;border-radius:6px}.navmodlist label{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.navsel{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;margin-top:6px}.navsel label{cursor:pointer}.item.far{cursor:default;opacity:.85}.wfix{margin-left:auto;cursor:pointer;font-size:13px;white-space:nowrap}.patchbox ol li{margin:2px 0}
+.patchbox{margin:0 0 10px}.navmods{margin-top:8px;font-size:12.5px}.navmods summary{cursor:pointer;color:#cfd6e4}.navmodlist{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto;margin:4px 0 6px;padding:4px 6px;background:#1a1e26;border-radius:6px}.navmodlist label{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;line-height:1.45;padding:1px 0}.navsel{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;margin-top:6px}.navsel label{cursor:pointer}.item.far{cursor:default;opacity:.85}.wfix{margin-left:auto;cursor:pointer;font-size:13px;white-space:nowrap}.patchbox ol li{margin:2px 0}
 .newpill{background:#ff5a4d;color:#fff;font-size:10px;font-weight:700;border-radius:4px;padding:1px 5px}.rundiff{font-size:12.5px;margin:0 0 8px;padding:6px 9px;border:1px solid #333a48;border-radius:8px}.rundiff details{margin-top:4px}
 .ptabs{display:flex;gap:6px;margin-bottom:8px}.ptab{flex:1;padding:7px 8px;font-weight:600;border-radius:8px}.ptab.on{background:#2a2f3a;border-color:#59627a}.ptab.ign.on{background:#3a3210;border-color:#c9a227;color:#ffe08a}
 .wgroup{margin:10px 0 4px}.whead{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:7px}.wdot{width:10px;height:10px;border-radius:50%;display:inline-block}
@@ -2533,12 +2533,17 @@ async function buildNavPatch(ctx, W, plan, readRec) {
     for (const c of cells) for (const e of idx.get(c.cellKey)) { const N = navParse(ctx, e); if (!N.inv) continue; const z = navSnap(ctx, W, cells, c, e, N); if (z) modOf(e).z = z; }
   }
   const jobs = [];
+  // A patch for some mods only (plan.only = plugin indexes) rewrites only navmeshes those mods (or the game itself) won.
+  // The other side of a border keeps its links: they are that other mod's problem, and its own patch fixes them.
+  const allowed = p => !plan.only || plan.only.has(p) || (ctx.plugins[p] && ctx.plugins[p].baseline);
+  let held = 0;
   for (const m of mods.values()) {
     const E = m.E ? eFinish(m.E) : null; if (!E && !m.z) continue;
+    if (!allowed(m.e.p)) { held++; continue; }
     const ci = ctx.cellInfo.get(m.e.cell), log = ctx.navLog.get(m.e.key); if (!ci || !ctx.cellRaw.get(m.e.cell) || !ctx.worldRaw.get(ci.world)) { skipped.push({ key: m.e.key, why: 'its cell record was not kept' }); continue; }
     jobs.push({ key: m.e.key, p: m.e.p, off: m.e.off, E, z: m.z, world: ci.world, cell: m.e.cell, pers: !!(log && log[log.length - 1].pers), last: m.e.p });
   }
-  if (cal.z) for (const d of plan.restore || []) if (d.fixable) jobs.push({ key: d.key, p: d.src.p, off: d.src.off, sink: true, world: d.world, cell: d.cell, pers: d.src.pers, last: d.last });
+  if (cal.z) for (const d of plan.restore || []) if (d.fixable && allowed(d.by)) jobs.push({ key: d.key, p: d.src.p, off: d.src.off, sink: true, world: d.world, cell: d.cell, pers: d.src.pers, last: d.last });
   const ready = [], icRaw = new Map();
   for (const j of jobs) {
     const P = ctx.plugins[j.p]; let u8 = null; try { u8 = await readRec(j.p, j.off); } catch (err) { u8 = null; }
@@ -2560,7 +2565,7 @@ async function buildNavPatch(ctx, W, plan, readRec) {
     }
     ready.push({ j, P, body, N, flags, rawId: dv.getUint32(12, true), tail: u8.slice(16, 24), subs, extra: f.extra });
   }
-  const count = { restored: 0, relinked: 0, fixed: 0, added: 0, cut: 0, snapped: 0, navs: 0 };
+  const count = { restored: 0, relinked: 0, fixed: 0, added: 0, cut: 0, snapped: 0, navs: 0, held };
   const write = (seed, check) => {
     const Wr = patchWriter(ctx, seed), { cat, sub, rec, grup, copyRec, keyId, lab } = Wr;
     const worlds = new Map(), ints = new Map(); let n = 0;
@@ -7033,7 +7038,7 @@ function navFiltered() {
 }
 async function makeNavPatch() {
   const W = S.W, F = navFiltered(), sel = S.navSel;
-  const plan = { restore: sel.del ? F.del.filter(d => d.fixable) : [], pairs: sel.link ? F.pairs : [], snap: sel.snap && F.nav.length ? F.nav : false };
+  const plan = { restore: sel.del ? F.del.filter(d => d.fixable) : [], pairs: sel.link ? F.pairs : [], snap: sel.snap && F.nav.length ? F.nav : false, only: F.mods || null };
   let r; try { r = await TSI.buildNavPatch(S.ctx, W, plan, readRec); } catch (e) { r = { bytes: null, error: e.message || String(e), skipped: [] }; }
   const why = r.skipped && r.skipped.length ? [...new Set(r.skipped.map(x => x.why))].slice(0, 3).join('; ') : '';
   let h;
@@ -7045,8 +7050,8 @@ async function makeNavPatch() {
     const did = [c.restored && `${c.restored} deleted navmesh${c.restored > 1 ? 'es' : ''} brought back and parked below the ground`,
       c.relinked && `${c.relinked} navmesh${c.relinked > 1 ? 'es' : ''} re-linked (${[c.fixed && c.fixed + ' links corrected', c.added && c.added + ' added', c.cut && c.cut + (c.cut > 1 ? ' dead ones cut' : ' dead one cut')].filter(Boolean).join(', ')})`,
       c.snapped && `${c.snapped} put back on the ground`].filter(Boolean).join('; ');
-    h = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${did}${r.skipped.length ? `. ${r.skipped.length} left out (${esc(why)})` : ''}.
-      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes). ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
+    h = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${did}${r.skipped.length ? `. ${r.skipped.length} left out (${esc(why)})` : ''}${c.held ? `. ${c.held} neighbouring navmesh${c.held > 1 ? 'es' : ''} from mods you did not pick ${c.held > 1 ? 'were' : 'was'} left as ${c.held > 1 ? 'they are' : 'it is'}: their side gets fixed in their own patch` : ''}.
+      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(F.mods ? [...F.mods, ...S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)].sort((a, b) => b - a).map(i => P(i).name)[0] : r.after)}</b> (the last plugin ${F.mods ? 'you picked, or that touches these navmeshes' : 'that touches these navmeshes'}). ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
       <div class="muted" style="margin-top:6px">This is the tool's newest and least proven kind of patch. Go to one of these places in game and watch an NPC or follower walk there before you keep it. Removing the plugin undoes everything. Make a new one when your load order changes.</div></div>`;
   }
   S.navMsg = { w: W, h };
