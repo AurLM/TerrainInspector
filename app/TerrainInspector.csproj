@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- A small Windows window around terrain-inspector.html.
+  <!-- A small Windows window around terrain-inspector.html, which is built INTO the .exe (users never see the HTML).
        .NET Framework 4.8 is built into Windows 10 and 11, so users install nothing for it. -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -14,6 +14,8 @@
     <DebugType>none</DebugType>
   </PropertyGroup>
   <ItemGroup>
+    <!-- the tool itself, taken from the root of the repository at build time -->
+    <EmbeddedResource Include="..\terrain-inspector.html" LogicalName="terrain-inspector.html" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4314.35" />

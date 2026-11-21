@@ -4,12 +4,12 @@ Put these in your GitHub repository, keeping the folders:
   .github/workflows/build-windows-exe.yml
   app/TerrainInspector.csproj
   app/Program.cs
-  terrain-inspector.html          <- replace it with each new version of the tool
+  terrain-inspector.html          <- replace it with each new version of the tool (it is built INTO the .exe)
   README.txt                      <- optional, copied next to the .exe
 
 Every push builds it. Then: Actions tab > latest "Build Windows exe" run > Artifacts > Terrain-Inspector-windows.
 That zip is the folder to upload to Nexus. Users unzip it and double-click "Terrain Inspector.exe".
-Keep the whole folder together: the .exe needs the .dll files and terrain-inspector.html next to it.
+Keep the whole folder together: the .exe needs the .dll files next to it. The HTML is inside the .exe, users never see it.
 
 Users need nothing installed: .NET Framework 4.8 and the Edge WebView2 Runtime are part of Windows 10 and 11.
 Settings and remembered folders are stored in %LOCALAPPDATA%\TerrainInspector.

@@ -1,6 +1,6 @@
-// Terrain Inspector for Windows: opens terrain-inspector.html (next to this .exe) in its own window,
+// Terrain Inspector for Windows: shows the tool (terrain-inspector.html, built into this .exe) in its own window,
 // using Microsoft Edge WebView2, which is part of Windows 10 and 11. Nothing goes to the internet:
-// the page is served from the program's own folder under a made-up local address.
+// the page is handed to the window straight from inside the program, under a made-up local address.
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -41,12 +41,11 @@ namespace TerrainInspector
 
         async Task Start()
         {
-            string dir = AppDomain.CurrentDomain.BaseDirectory;
-            if (!File.Exists(Path.Combine(dir, Page)))
+            byte[] html;
+            using (var res = typeof(MainForm).Assembly.GetManifestResourceStream(Page))
             {
-                MessageBox.Show($"{Page} is missing.\n\nKeep it in the same folder as Terrain Inspector.exe (unzip the whole download, not only the .exe).",
-                    "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                Close(); return;
+                if (res == null) { MessageBox.Show("This build of Terrain Inspector is incomplete (the tool page is missing inside it).", "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error); Close(); return; }
+                using (var ms = new MemoryStream()) { res.CopyTo(ms); html = ms.ToArray(); }
             }
             try
             {
@@ -69,7 +68,15 @@ namespace TerrainInspector
             }
 
             var cw = web.CoreWebView2;
-            cw.SetVirtualHostNameToFolderMapping(Host, dir, CoreWebView2HostResourceAccessKind.Deny);
+            // every request to the local address gets the page from inside the program
+            cw.AddWebResourceRequestedFilter($"https://{Host}/*", CoreWebView2WebResourceContext.All);
+            cw.WebResourceRequested += (s, e) =>
+            {
+                var path = new Uri(e.Request.Uri).AbsolutePath;
+                e.Response = path == "/" || path == "/" + Page
+                    ? cw.Environment.CreateWebResourceResponse(new MemoryStream(html), 200, "OK", "Content-Type: text/html; charset=utf-8")
+                    : cw.Environment.CreateWebResourceResponse(null, 404, "Not Found", "");
+            };
             cw.Settings.IsStatusBarEnabled = false;
             cw.Settings.AreDefaultContextMenusEnabled = true;
             // links to Nexus, GitHub, etc. open in the normal browser, not inside the tool
