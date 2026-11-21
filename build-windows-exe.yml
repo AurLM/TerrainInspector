@@ -1,0 +1,43 @@
+# Builds "Terrain Inspector.exe" on GitHub's Windows machines, with terrain-inspector.html built INTO it.
+# Needs, at the root of the repository: terrain-inspector.html, and the app/ folder.
+# The result is under Actions > the latest run > Artifacts > Terrain-Inspector-windows (a zip of the folder to upload to Nexus).
+name: Build Windows exe
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check the tool page is in the repository
+        shell: bash
+        run: test -f terrain-inspector.html || { echo "terrain-inspector.html is missing at the root of the repository"; exit 1; }
+
+      - name: Build the program (the tool page goes inside the .exe)
+        run: dotnet publish app/TerrainInspector.csproj -c Release -o out
+
+      - name: Add the read-me, if any, and remove build leftovers
+        shell: bash
+        run: |
+          if [ -f README.txt ]; then cp README.txt out/; fi
+          rm -f out/*.pdb out/*.xml
+          ls -la out
+
+      - name: Check that every file the program needs is there
+        shell: bash
+        run: |
+          for f in "Terrain Inspector.exe" WebView2Loader.dll Microsoft.Web.WebView2.Core.dll Microsoft.Web.WebView2.WinForms.dll; do
+            test -f "out/$f" || { echo "missing: $f"; exit 1; }
+          done
+          test ! -f out/terrain-inspector.html || { echo "the HTML should be inside the .exe, not next to it"; exit 1; }
+          # the .exe must be bigger than the page it carries
+          test $(stat -c %s "out/Terrain Inspector.exe") -gt $(stat -c %s terrain-inspector.html) || { echo "the tool page did not go into the .exe"; exit 1; }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Terrain-Inspector-windows
+          path: out
