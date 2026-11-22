@@ -525,7 +525,8 @@ function newContext(opts) {
     enableParent: new Map(), // refKey -> [parentKey, opposite]
     baseInfo: new Map(),    // baseKey -> {t, edid, model}
     ltex: new Map(),        // ltexKey -> {edid, txst, grass: [grasKey]}
-    cellRawVers: new Map(), worldRawVers: new Map(),   // every CELL / WRLD record version, for patches made for some mods only
+    cellRawVers: new Map(), worldRawVers: new Map(),
+    ownHidden: new Map(),   // objects an earlier objects patch of this tool switched off (keep: false) or moved (keep: true), still winning: key -> {p, off, w, cell, pers, keep}   // every CELL / WRLD record version, for patches made for some mods only
     weathers: new Map(),    // wthrKey -> {edid, colors[type][time] = [r,g,b], fog:[dayNear,dayFar,nightNear,nightFar], flags}
     climates: new Map(),    // clmtKey -> {edid, weathers:[{key, chance}], times:[sunriseBegin, sunriseEnd, sunsetBegin, sunsetEnd] (hours)}
     gras: new Map(),        // grasKey -> {model, bounds, density, minSlope, maxSlope, water, waterType, posRange, heightRange, flags}
@@ -589,14 +590,16 @@ function readHeader(buf) {
   const size = dv.getUint32(4, true), flags = dv.getUint32(8, true);
   const formVersion = dv.getUint16(20, true);
   const masters = [];
-  let hedr = null;
+  let hedr = null, author = '', desc = '';
   const b = recordBody(u8, dv, 0, size, flags);
   forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
     if (t === TY.MAST) masters.push(zstr(b.u8, o, o + l));
+    else if (t === T('CNAM')) author = zstr(b.u8, o, o + l);
+    else if (t === T('SNAM')) desc = zstr(b.u8, o, o + l);
     else if (t === T('HEDR') && l >= 4) hedr = b.dv.getFloat32(o, true);
   });
   if (hedr === null) throw new Error('not a Skyrim plugin (no HEDR)');
-  return { flags, isESM: !!(flags & 1), isESL: !!(flags & 0x200), isLocalized: !!(flags & 0x80), masters, headerEnd: 24 + size, hedr, formVersion };
+  return { flags, isESM: !!(flags & 1), isESL: !!(flags & 0x200), isLocalized: !!(flags & 0x80), masters, headerEnd: 24 + size, hedr, formVersion, author, desc };
 }
 
 /** Parse one plugin (ArrayBuffer) into the context. Must be called in load order. */
@@ -609,6 +612,8 @@ function parsePlugin(ctx, name, buf, loadIndex) {
     lmasters: new Set(hdr.masters.map(m => m.toLowerCase())),
     masterG: hdr.masters.map(m => nameIndex(ctx, m)), selfG: nameIndex(ctx, name),
     isESM: hdr.isESM, isESL: hdr.isESL || lname.endsWith('.esl'), baseline: isBaselineName(ctx, lname), localized: hdr.isLocalized,
+    ownGround: hdr.author === 'Terrain Inspector' && /^Ground patch:/.test(hdr.desc),   // an earlier ground patch made by this tool
+    ownDisable: hdr.author === 'Terrain Inspector' && /^Switches off/.test(hdr.desc),     // an earlier objects patch (disabled / moved) made by this tool
     counts: { lands: 0, cells: 0, refs: 0 }
   };
   ctx.plugins.push(p);
@@ -709,7 +714,8 @@ function parsePlugin(ctx, name, buf, loadIndex) {
     if (type === TY.REFR) {
       if (world == null || !ctx.opts.refs) return;
       const key = resolve(p, raw);
-      if (flags & FLAG_DELETED) { ctx.refs.delete(key); ctx.disabled.add(key); ctx.enableParent.delete(key); return; }
+      if (flags & FLAG_DELETED) { ctx.refs.delete(key); ctx.disabled.add(key); ctx.enableParent.delete(key); ctx.ownHidden.delete(key); return; }
+      if (p.ownDisable) ctx.ownHidden.set(key, { p: p.idx, off, w: world, cell, pers: childType === 8, keep: !(flags & FLAG_DISABLED) }); else ctx.ownHidden.delete(key);
       if (flags & FLAG_DISABLED) ctx.disabled.add(key); else ctx.disabled.delete(key);
       const b = recordBody(u8, dv, off, size, flags);
       let base = -1, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sc = 1, hasPos = false, ep = null;
@@ -1783,6 +1789,29 @@ function vmadRemap(d, fix) {
     return q === d.length;           // placed objects carry no script fragments after this
   } catch (e) { return false; }
 }
+// What a picked object becomes in the patch: switched off (default), moved by it.move = {dx, dy, dz}, or kept as an
+// earlier patch of ours left it (it.keep). fields = [[type, bytes]]; returns the new list and the record flags.
+function refrAction(it, fields, flags, espBytes) {
+  const XESP = TY.XESP, DATA = TY.DATA;
+  if (it.keep) return { fields, flags: flags & ~FLAG_COMPRESSED };
+  if (it.move) {
+    const out = fields.map(([t, d]) => {
+      if (t !== DATA || d.length < 12) return [t, d];
+      const n = d.slice(), v = new DataView(n.buffer);
+      v.setFloat32(0, v.getFloat32(0, true) + (it.move.dx || 0), true); v.setFloat32(4, v.getFloat32(4, true) + (it.move.dy || 0), true); v.setFloat32(8, v.getFloat32(8, true) + (it.move.dz || 0), true);
+      return [t, n];
+    });
+    return { fields: out, flags: flags & ~FLAG_COMPRESSED };
+  }
+  const out = []; let put = false;
+  for (const [t, d] of fields) {
+    if (t === XESP) { if (!put) { out.push([XESP, espBytes]); put = true; } continue; }
+    if (t === DATA && !put) { out.push([XESP, espBytes]); put = true; }
+    out.push([t, d]);
+  }
+  if (!put) out.push([XESP, espBytes]);
+  return { fields: out, flags: (flags & ~FLAG_COMPRESSED) | FLAG_DISABLED };
+}
 // One placed object rewritten for the patch's own master list; null when a field cannot be renumbered safely.
 function refrRenumbered(P, b, fix) {
   const out = []; let ok = true;
@@ -1803,6 +1832,15 @@ function refrRenumbered(P, b, fix) {
 // All picked objects in ONE plugin: each record is renumbered for the patch's master list. Objects with a field this
 // tool does not know how to renumber are put in a small extra plugin of their own mod (the old, byte-exact way).
 async function buildDisablePatch(ctx, items, readRec) {
+  // objects an earlier objects patch of this tool switched off or moved are carried in, so the new plugin replaces them all
+  const have = new Set(items.map(it => it.key)), carried = [];
+  for (const [key, r] of ctx.ownHidden) if (!have.has(key)) carried.push({ key, r, carried: true, keep: r.keep });
+  items = items.concat(carried);
+  const replaces = [...new Set(carried.map(it => ctx.plugins[it.r.p].name))];
+  const res = await disableBoth(ctx, items, readRec);
+  return Object.assign(res, { carried: carried.length, replaces });
+}
+async function disableBoth(ctx, items, readRec) {
   const one = await disableOne(ctx, items, readRec);
   if (!one.rest.length) return { files: one.file ? [one.file] : [], skipped: one.skipped };
   const old = await disablePerMod(ctx, one.rest, readRec);
@@ -1823,19 +1861,14 @@ async function disableOne(ctx, items, readRec) {
   const write = seed => {
     const Wr = patchWriter(ctx, seed), { cat, sub, rec, grup, copyRec, keyId, lab } = Wr;
     const player = () => ((Wr.idx('Skyrim.esm') << 24) | 0x14) >>> 0;
-    const worlds = new Map(); let done = 0; const left = [];
+    const worlds = new Map(); let done = 0, moved = 0, off = 0; const left = [];
     for (const x of ready) {
       const fields = refrRenumbered(x.P, x.b, id => Wr.remap(x.P, id));
       if (!fields) { left.push(x.it); continue; }
       const esp = new Uint8Array(8), ev = new DataView(esp.buffer); ev.setUint32(0, player(), true); ev.setUint32(4, 1, true);   // enabled only while the player is disabled
-      const parts = []; let put = false;
-      for (const [t, d] of fields) {
-        if (t === XESP) { if (!put) { parts.push(sub(XESP, esp)); put = true; } continue; }
-        if (t === DATA && !put) { parts.push(sub(XESP, esp)); put = true; }
-        parts.push(sub(t, d));
-      }
-      if (!put) parts.push(sub(XESP, esp));
-      const out = rec(REFR, (x.flags & ~FLAG_COMPRESSED) | FLAG_DISABLED, Wr.remap(x.P, x.raw), x.tail, cat(parts));
+      const act = refrAction(x.it, fields, x.flags, esp);
+      const out = rec(REFR, act.flags, Wr.remap(x.P, x.raw), x.tail, cat(act.fields.map(([t, d]) => sub(t, d))));
+      if (x.it.move && !x.it.keep) moved++; else if (!x.it.keep && !(x.it.carried && x.it.r.keep)) off++;
       const it = x.it; let w = worlds.get(it.r.w); if (!w) worlds.set(it.r.w, w = new Map());
       let c = w.get(it.r.cell); if (!c) w.set(it.r.cell, c = { p: [], t: [] });
       (it.r.pers ? c.p : c.t).push(out); done++;
@@ -1855,8 +1888,10 @@ async function disableOne(ctx, items, readRec) {
       for (const [bk, bl] of blocks) inner.push(grup(lab(...bk.split(',').map(Number)), 4, [...bl].map(([sk, l2]) => grup(lab(...sk.split(',').map(Number)), 5, l2.flatMap(([ck, c]) => cellGroup(ck, c))))));
       tops.push(copyRec(ctx.worldRaw.get(wk), Wr.WRLD_F), grup(keyId(wk), 1, inner));
     }
-    const from = [...new Set(ready.filter(x => !left.includes(x.it)).map(x => x.P.name))];
-    return { Wr, done, left, from, body: tops.length ? grup(T('WRLD'), 0, tops) : null };
+    // where an object really comes from: for one carried from an earlier patch of ours, the last plugin that patch loads after
+    const srcOf = x => { if (!x.P.ownDisable) return x.P.name; const at = new Map(ctx.plugins.map(q => [q.lname, q.idx])); return x.P.masters.slice().sort((a, b) => (at.get(a.toLowerCase()) ?? -1) - (at.get(b.toLowerCase()) ?? -1)).pop() || x.P.name; };
+    const from = [...new Set(ready.filter(x => !left.includes(x.it)).map(srcOf))];
+    return { Wr, done, moved, left, from, body: tops.length ? grup(T('WRLD'), 0, tops) : null };
   };
   if (!ready.length) return { file: null, rest, skipped };
   const first = write([]);
@@ -1864,8 +1899,9 @@ async function disableOne(ctx, items, readRec) {
   const loadIdx = new Map(ctx.plugins.map(P => [P.lname, P.idx])), at = m => loadIdx.has(m.toLowerCase()) ? loadIdx.get(m.toLowerCase()) : -1;
   const fin = write(first.Wr.masters.slice().sort((a, b) => at(a) - at(b)));
   const last = fin.from.slice().sort((a, b) => at(a) - at(b)).pop();
-  const head = fin.Wr.tes4(`Switches off ${fin.done} object(s) picked in Terrain Inspector, placed by: ${fin.from.join(', ')}. Load after all of them. Make it again if your load order changes.`);
-  return { file: { name: 'Terrain Inspector - Disabled objects.esp', bytes: fin.Wr.cat([head, fin.body]), count: fin.done, from: last, fromAll: fin.from }, rest: fin.left, skipped };
+  const nMoved = ready.filter(x => !fin.left.includes(x.it) && (x.it.move || x.it.keep)).length;
+  const head = fin.Wr.tes4(`Switches off ${fin.done - nMoved} object(s)${nMoved ? ` and moves ${nMoved} object(s)` : ''} picked in Terrain Inspector, placed by: ${fin.from.join(', ')}. Load after all of them. Make it again if your load order changes.`);
+  return { file: { name: 'Terrain Inspector - Disabled objects.esp', bytes: fin.Wr.cat([head, fin.body]), count: fin.done, moved: nMoved, from: last, fromAll: fin.from }, rest: fin.left, skipped };
 }
 async function disablePerMod(ctx, items, readRec) {
   const byP = new Map(), skipped = [];
@@ -1874,23 +1910,20 @@ async function disablePerMod(ctx, items, readRec) {
   for (const [pi, list] of byP) {
     const P = ctx.plugins[pi];
     // the object's own plugin and its masters come first, in its order: that is what keeps the copied records valid as they are
-    const Wr = patchWriter(ctx, [...P.masters, P.name]), { cat, sub, rec, grup, copyRec, keyId, lab } = Wr;
+    // (an earlier per-mod patch of ours already lists its mod last among its masters: same numbering, and it is not a master itself)
+    const src = P.ownDisable ? P.masters[P.masters.length - 1] : P.name;
+    const Wr = patchWriter(ctx, P.ownDisable ? [...P.masters] : [...P.masters, P.name]), { cat, sub, rec, grup, copyRec, keyId, lab } = Wr;
     const player = ((Wr.idx('Skyrim.esm') << 24) | 0x14) >>> 0;
     const worlds = new Map(); let done = 0;
     for (const it of list) {
       let u8; try { u8 = await readRec(pi, it.r.off); } catch (e) { u8 = null; }
       const dv = u8 && new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
       if (!u8 || u8.length < 24 || dv.getUint32(0, true) !== REFR || resolve(P, dv.getUint32(12, true)) !== it.key) { skipped.push(it); continue; }
-      const size = dv.getUint32(4, true), flags = dv.getUint32(8, true), b = recordBody(u8, dv, 0, size, flags), parts = [];
+      const size = dv.getUint32(4, true), flags = dv.getUint32(8, true), b = recordBody(u8, dv, 0, size, flags), fields = [];
       const esp = new Uint8Array(8), ev = new DataView(esp.buffer); ev.setUint32(0, player, true); ev.setUint32(4, 1, true);   // enabled only while the player is disabled
-      let put = false;
-      forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
-        if (t === XESP) { if (!put) { parts.push(sub(XESP, esp)); put = true; } return; }
-        if (t === DATA && !put) { parts.push(sub(XESP, esp)); put = true; }
-        parts.push(sub(t, b.u8.slice(o, o + l)));
-      });
-      if (!put) parts.push(sub(XESP, esp));
-      const out = rec(REFR, (flags & ~FLAG_COMPRESSED) | FLAG_DISABLED, dv.getUint32(12, true), u8.subarray(16, 24), cat(parts));
+      forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => fields.push([t, b.u8.slice(o, o + l)]));
+      const act = refrAction(it, fields, flags, esp);
+      const out = rec(REFR, act.flags, dv.getUint32(12, true), u8.subarray(16, 24), cat(act.fields.map(([t, d]) => sub(t, d))));
       let w = worlds.get(it.r.w); if (!w) worlds.set(it.r.w, w = new Map());
       let c = w.get(it.r.cell); if (!c) w.set(it.r.cell, c = { p: [], t: [] });
       (it.r.pers ? c.p : c.t).push(out); done++;
@@ -1912,8 +1945,8 @@ async function disablePerMod(ctx, items, readRec) {
       tops.push(copyRec(ctx.worldRaw.get(wk), Wr.WRLD_F), grup(keyId(wk), 1, inner));
     }
     const top = grup(T('WRLD'), 0, tops);
-    const head = Wr.tes4(`Switches off ${done} object(s) placed by ${P.name}, picked in Terrain Inspector. Load after that plugin. Make it again if your load order changes.`);
-    files.push({ name: `Terrain Inspector - Disabled objects - ${P.name.replace(/\.es[mpl]$/i, '')}.esp`, bytes: cat([head, top]), count: done, from: P.name });
+    const head = Wr.tes4(`Switches off ${done} object(s) placed by ${src}, picked in Terrain Inspector. Load after that plugin. Make it again if your load order changes.`);
+    files.push({ name: `Terrain Inspector - Disabled objects - ${src.replace(/\.es[mpl]$/i, '')}.esp`, bytes: cat([head, top]), count: done, from: src });
   }
   return { files, skipped };
 }
@@ -2146,12 +2179,16 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     preview.set(c, v);
   }
   const used = new Set();
-  const need = P => { for (const m of P.masters) used.add(m.toLowerCase()); used.add(P.lname); };
+  const need = P => { for (const m of P.masters) used.add(m.toLowerCase()); if (!P.ownGround) used.add(P.lname); };   // an earlier patch of ours is replaced, never a master
   const wraw = ctx.worldRaw.get(W.world.key); if (!wraw) return { bytes: null, fixed: 0, failed: seams, cells: 0, left: [], error: 'the worldspace record was not kept' };
   need(ctx.plugins[wraw.p]);
   for (const { w } of TNEW.values()) for (const t of w.keys()) if (t >= 0) used.add((ctx.names[Math.floor(t / NAMEBASE)] || '').toLowerCase());
   used.delete('');
-  const cells = [...new Set([...NEW.keys(), ...TNEW.keys()])].filter(c => ctx.cellRaw.get(c.cellKey));
+  // An earlier ground patch from this tool that is in the load order: its cells are carried into the new one, so the
+  // new plugin replaces it and everything stays in ONE plugin (the old one is then switched off).
+  const carried = [];
+  for (const c of W.cells.values()) if (c.winner && ctx.plugins[c.winner.p].ownGround && !NEW.has(c) && !TNEW.has(c) && ctx.cellRaw.get(c.cellKey)) carried.push(c);
+  const cells = [...new Set([...NEW.keys(), ...TNEW.keys(), ...carried])].filter(c => ctx.cellRaw.get(c.cellKey));
   for (const c of cells) { need(ctx.plugins[ctx.cellRaw.get(c.cellKey).p]); need(ctx.plugins[c.winner.p]); }
   const real = new Map(ctx.plugins.map(P => [P.lname, P]));
   const masters = [...used].sort((a, b) => (real.has(a) ? real.get(a).idx : -1) - (real.has(b) ? real.get(b).idx : -1)).map(l => real.has(l) ? real.get(l).name : l);
@@ -2223,8 +2260,14 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
   // first pass finds which plugins are really needed; the second writes them in load order
   const loadIdx = new Map(ctx.plugins.map(P => [P.lname, P.idx]));
   const fin = write(write([]).masters.slice().sort((a, b) => (loadIdx.has(a.toLowerCase()) ? loadIdx.get(a.toLowerCase()) : -1) - (loadIdx.has(b.toLowerCase()) ? loadIdx.get(b.toLowerCase()) : -1)));
-  const lastLand = Math.max(...cells.map(c => c.winner.p));
-  return { bytes: fin.bytes, fixed: todo.length - left.length, failed, left, cells: cells.length, worse, masters: fin.masters, preview, editCells, editBad, texCells: TNEW.size, blended: blendDone, painted, after: ctx.plugins[lastLand].name };
+  // what it must load after: the last plugin below it for these cells (an earlier patch of ours does not count: this one replaces it)
+  const below = c => { if (!ctx.plugins[c.winner.p].ownGround) return c.winner.p; for (let i = c.lands.length - 1; i >= 0; i--) if (!ctx.plugins[c.lands[i].p].ownGround) return c.lands[i].p; return 0; };
+  const lastLand = Math.max(0, ...cells.map(below));
+  const replaces = [...new Set(cells.filter(c => ctx.plugins[c.winner.p].ownGround).map(c => ctx.plugins[c.winner.p].name))];
+  // an earlier patch that also holds ground in another worldspace cannot be removed yet: only this worldspace was carried
+  const elsewhere = new Set();
+  for (const [ck, lands] of ctx.cellLands) { const last = lands[lands.length - 1], ci = ctx.cellInfo.get(ck); if (last && ci && ci.world !== W.world.key && ctx.plugins[last.p].ownGround) elsewhere.add(ctx.plugins[last.p].name); }
+  return { bytes: fin.bytes, fixed: todo.length - left.length, failed, left, cells: cells.length, worse, masters: fin.masters, preview, editCells, editBad, texCells: TNEW.size, blended: blendDone, painted, carried: carried.length, replaces, keep: replaces.filter(n => elsewhere.has(n)), after: ctx.plugins[lastLand].name };
 }
 /* ================================================================================================
    Navmesh health: deleted navmeshes, links between navmeshes that no longer hold, and their patch.
@@ -3973,7 +4016,9 @@ function createView3D(host, deps) {
     for (const c of todo) for (const r of (refs.get(c.x + ',' + c.y) || [])) {
       const bi = ctx().baseInfo.get(r.base); if (!bi || !bi.model) continue;
       if (r.key && deps.hiddenRefs && deps.hiddenRefs().has(r.key)) continue;   // switched off by you in this session
-      if (!r.key || TSI.refEnabled(ctx(), r.key)) list.push([r, bi]);
+      const mv = r.key && deps.movedRefs && deps.movedRefs().get(r.key);           // moved by you in this session: shown where it will be
+      const rr = mv ? Object.assign({}, r, { x: r.x + mv.dx, y: r.y + mv.dy, z: r.z + mv.dz, _orig: r }) : r;
+      if (!r.key || TSI.refEnabled(ctx(), r.key)) list.push([rr, bi]);
     }
     const meshes = new Map();
     const loadAll = async models => {
@@ -4776,7 +4821,7 @@ function createView3D(host, deps) {
       <ul><li>Click ${K('⛏ Terraform')}, choose ${K('▼ Lower')} or ${K('▲ Raise')}, then set the brush size and the depth per click.</li><li><b>Click the ground</b> to apply. Click again to go further.</li><li>${K('🧽 Remove texture')}: click the texture to take away (snow, for example), then click over it: what lies under it takes its place. ${K('🖌 Paint texture')} works the same way to paint one. Cell borders stay matched.</li><li>Neighbouring cells follow automatically, so you can't create a seam.</li><li>${K('↶ Undo')} takes back the last click. ${K('🛠 Create patch')} saves your edits in the same patch as the seam fixes.</li></ul>
       <p class="muted">Objects and NPC paths are not moved with the ground.</p>`],
     ['🔍 Identify / disable an object', `<p>Find out what something is, and remove it if you don't want it.</p>
-      <ul><li>Click ${K('🔍 Identify / disable object')}, then click a building, rock, tree or any object.</li><li>A box shows its name, its model file and <b>which mod placed it</b>.</li><li>${K('🚫 Disable this object')} removes it from the view. Repeat for as many objects as you like.</li><li>A counter appears at the top with ${K('🛠 Create patch')}: it downloads a plugin that switches those objects off in game, the same way as doing it by hand in xEdit.</li></ul>
+      <ul><li>Click ${K('🔍 Identify / disable object')}, then click a building, rock, tree or any object.</li><li>A box shows its name, its model file and <b>which mod placed it</b>.</li><li>${K('🚫 Disable this object')} removes it from the view. ${K('⬇ Drop to ground')} puts a floating object back on the ground (▲ ▼ nudge it). Repeat for as many objects as you like.</li><li>A counter appears at the top with ${K('🛠 Create patch')}: it downloads a plugin that switches those objects off in game, the same way as doing it by hand in xEdit.</li></ul>
       <p class="muted">Pink boxes are objects whose model file couldn't be found.</p>`],
     ['🌿 Identify grass', `<p>Track down wrong or purple grass.</p>
       <ul><li>Click ${K('🌿 Identify grass')}, then click the ground.</li><li>The panel lists the ground textures at that spot, the grass each one grows, and the mod that decides each.</li><li>Every model and texture file is marked <b>found</b> or <b>MISSING</b>. A missing texture is what turns grass purple in game.</li></ul>`],
@@ -5060,8 +5105,21 @@ function createView3D(host, deps) {
       + (ob.m.missing ? `<br><span class="muted">${ob.m.missing === 'missing' ? 'Shown as a pink box. The game has no model to show here either: the mod that placed it expects a file you do not have, usually from a requirement that is not installed.' : 'Shown as a pink box: the model exists, the tool just cannot draw it. It looks normal in game.'}</span>` : '')
       + (ob.m.missing ? '' : `<br><span class="muted">${ob.m.shapes.length} part(s) · ${ob.m.shapes.filter(x => x.alpha).length} see-through · textures: ${esc([...new Set(ob.m.shapes.map(x => x.tex || '—'))].slice(0, 3).join(', '))}</span>`);
     if (r.key != null && r.off != null && deps.hideRef) {
-      tip.innerHTML += `<br><button class="small v3-hide" style="margin-top:5px;pointer-events:auto">🚫 Disable this object</button>`;
-      tip.querySelector('.v3-hide').onclick = e => { e.stopPropagation(); deps.hideRef(r, bi.edid || bi.model || 'object'); tip.style.display = 'none'; if (st.selObj) { gl.deleteBuffer(st.selObj.b); st.selObj = null; } refreshHidden(); };
+      tip.innerHTML += `<br><button class="small v3-hide" style="margin-top:5px;pointer-events:auto">🚫 Disable this object</button>`
+        + (deps.moveRef ? `<div style="margin-top:5px;pointer-events:auto;display:flex;gap:4px;align-items:center;flex-wrap:wrap"><button class="small v3-drop" title="Lowers (or raises) it until its lowest point touches the ground under it">⬇ Drop to ground</button><span class="muted" style="font-size:11.5px">or nudge</span><button class="small" data-nz="1" title="Up">▲</button><button class="small" data-nz="-1" title="Down">▼</button><select class="v3-nstep" title="Nudge step">${[4, 16, 64].map(v => `<option value="${v}" ${v === st.nudge ? 'selected' : ''}>${v} u</option>`).join('')}</select></div><div class="v3-movemsg muted" style="font-size:11.5px"></div>` : '');
+      const orig = r._orig || r, name = bi.edid || bi.model || 'object', done = () => { tip.style.display = 'none'; if (st.selObj) { gl.deleteBuffer(st.selObj.b); st.selObj = null; } refreshHidden(); };
+      tip.querySelector('.v3-hide').onclick = e => { e.stopPropagation(); deps.hideRef(orig, name); done(); };
+      if (deps.moveRef) {
+        tip.querySelector('.v3-nstep').onchange = e => { st.nudge = Number(e.target.value); };
+        tip.querySelector('.v3-nstep').onclick = e => e.stopPropagation();
+        tip.querySelectorAll('[data-nz]').forEach(b => b.onclick = e => { e.stopPropagation(); deps.moveRef(orig, name, { dx: 0, dy: 0, dz: Number(b.dataset.nz) * st.nudge }); done(); });
+        tip.querySelector('.v3-drop').onclick = e => {
+          e.stopPropagation(); const dz = dropDelta(ob), msg = tip.querySelector('.v3-movemsg');
+          if (dz == null) { msg.textContent = 'No ground under it here.'; return; }
+          if (Math.abs(dz) < 1) { msg.textContent = 'It already touches the ground.'; return; }
+          deps.moveRef(orig, name, { dx: 0, dy: 0, dz }); done();
+        };
+      }
     }
     // yellow box around it
     const M = TSIAssets.refMatrix(r), A = M.m, t0 = M.t || [r.x, r.y, r.z], mn = ob.m.min, mxx = ob.m.max, L = [], col = [1, 0.9, 0.2, 1];
@@ -5069,6 +5127,24 @@ function createView3D(host, deps) {
     for (const [a, b] of [[[0,0,0],[1,0,0]],[[0,1,0],[1,1,0]],[[0,0,1],[1,0,1]],[[0,1,1],[1,1,1]],[[0,0,0],[0,1,0]],[[1,0,0],[1,1,0]],[[0,0,1],[0,1,1]],[[1,0,1],[1,1,1]],[[0,0,0],[0,0,1]],[[1,0,0],[1,0,1]],[[0,1,0],[0,1,1]],[[1,1,0],[1,1,1]]]) { push(L, ...Pt(...a), col); push(L, ...Pt(...b), col); }
     const bb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(L), gl.STATIC_DRAW);
     st.selObj = { b: bb, n: L.length / 7 }; st.dirty = true;
+  }
+  // How far an object must move up or down so that its lowest point touches the ground under that point
+  // (its real shape, rotation and scale; for a missing model, its box). null when there is no ground under it.
+  st.nudge = 16;
+  function dropDelta(ob) {
+    const r = ob.r, A = TSIAssets.refMatrix(r).m, pts = [];
+    if (ob.m.shapes.length) {
+      let total = 0; for (const sh of ob.m.shapes) total += sh.pos.length / 3;
+      const step = Math.max(1, Math.floor(total / 4000));
+      for (const sh of ob.m.shapes) for (let i = 0; i < sh.pos.length; i += 3 * step) pts.push([sh.pos[i], sh.pos[i + 1], sh.pos[i + 2]]);
+    } else { const a = ob.m.min, z = ob.m.max; for (const x of [a[0], z[0]]) for (const y of [a[1], z[1]]) pts.push([x, y, a[2]]); }
+    let gap = Infinity;
+    for (const [x, y, z] of pts) {
+      const wx = r.x + A[0] * x + A[1] * y + A[2] * z, wy = r.y + A[3] * x + A[4] * y + A[5] * z, wz = r.z + A[6] * x + A[7] * y + A[8] * z;
+      const g = heightAtWorld(wx, wy); if (g == null) continue;
+      if (wz - g < gap) gap = wz - g;
+    }
+    return gap === Infinity ? null : -gap;
   }
   /* ---------- terraform: a brush that lowers or raises the ground; every cell sharing a point gets the same change ---------- */
   st.terra = { on: false, dir: -1, size: 3, power: 64, blendN: 8, amt: 0.6, tex: null, picking: true };
@@ -5155,10 +5231,10 @@ function createView3D(host, deps) {
   };
   /* Objects you switched off: gone from the view at once; "Create patch" makes it real in game. */
   function refreshHidden(rebuild = true) {
-    const bar = q('.v3-hidbar'), n = deps.hiddenRefs ? deps.hiddenRefs().size : 0;
-    bar.style.display = n ? '' : 'none';
-    bar.innerHTML = n ? `<b>${n}</b> object${n > 1 ? 's' : ''} disabled <button class="small primary v3-mkdis" title="Downloads a small plugin that switches these objects off in game. Your load order and the original mods are not changed.">🛠 Create patch</button> <button class="small v3-undis" title="Bring the last one back">↶ Undo</button>` : '';
-    if (n) {
+    const bar = q('.v3-hidbar'), n = deps.hiddenRefs ? deps.hiddenRefs().size : 0, nm = deps.movedRefs ? [...deps.movedRefs().keys()].filter(k => !deps.hiddenRefs().has(k)).length : 0;
+    bar.style.display = n || nm ? '' : 'none';
+    bar.innerHTML = n || nm ? `${n ? `<b>${n}</b> object${n > 1 ? 's' : ''} disabled` : ''}${n && nm ? ' · ' : ''}${nm ? `<b>${nm}</b> moved` : ''} <button class="small primary v3-mkdis" title="Downloads a small plugin that switches these objects off in game. Your load order and the original mods are not changed.">🛠 Create patch</button> <button class="small v3-undis" title="Undo the last change">↶ Undo</button>` : '';
+    if (n || nm) {
       q('.v3-mkdis').onclick = async () => { const pan = q('.v3-gpanel'); pan.style.display = 'block'; pan.innerHTML = 'Making the patch…'; pan.innerHTML = closeBtn + await deps.makeDisablePatch(); wireClose(); };
       q('.v3-undis').onclick = () => { deps.unhideLast(); refreshHidden(); };
     }
@@ -5414,7 +5490,7 @@ function createView3D(host, deps) {
   });
   new ResizeObserver(() => { st.dirty = true; }).observe(canvas);
 
-  return { open, reopen, close, _objs: () => st.objs || [], _pick: (mx, my, ng) => { st._noGround = ng; const o = pickObject(mx, my); st._noGround = false; return o ? o.bi.edid : null; }, _ground: (mx, my) => pickGround(mx, my), _exag: () => st.exag, _proj: (x, y, z) => { const v = st.lastMvp; if (!v) return null; const px = x - st.origin[0], py = y - st.origin[1], pz = (z - st.origin[2]) * st.exag; const cx = v[0] * px + v[4] * py + v[8] * pz + v[12], cy = v[1] * px + v[5] * py + v[9] * pz + v[13], cw = v[3] * px + v[7] * py + v[11] * pz + v[15]; return cw > 0 ? [(cx / cw * 0.5 + 0.5) * canvas.clientWidth, (0.5 - cy / cw * 0.5) * canvas.clientHeight] : null; }, get isOpen() { return st.open; }, refresh() { if (st.open) { buildFlat(); renderSide(); if (st.navOn) buildNav(); st.dirty = true; } }, setNav, _st: st, isGL2 };
+  return { open, reopen, close, _objs: () => st.objs || [], _drop: key => { const o = (st.objs || []).find(o => o.r.key === key); return o ? dropDelta(o) : undefined; }, _pick: (mx, my, ng) => { st._noGround = ng; const o = pickObject(mx, my); st._noGround = false; return o ? o.bi.edid : null; }, _ground: (mx, my) => pickGround(mx, my), _exag: () => st.exag, _proj: (x, y, z) => { const v = st.lastMvp; if (!v) return null; const px = x - st.origin[0], py = y - st.origin[1], pz = (z - st.origin[2]) * st.exag; const cx = v[0] * px + v[4] * py + v[8] * pz + v[12], cy = v[1] * px + v[5] * py + v[9] * pz + v[13], cw = v[3] * px + v[7] * py + v[11] * pz + v[15]; return cw > 0 ? [(cx / cw * 0.5 + 0.5) * canvas.clientWidth, (0.5 - cy / cw * 0.5) * canvas.clientHeight] : null; }, get isOpen() { return st.open; }, refresh() { if (st.open) { buildFlat(); renderSide(); if (st.navOn) buildNav(); st.dirty = true; } }, setNav, _st: st, isGL2 };
 }
 root.createView3D = createView3D;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -5430,7 +5506,7 @@ const fmt = n => Math.round(n).toLocaleString('en-US');
 /* ---------------- state ---------------- */
 const S = {
   files: new Map(),      // lname -> File (last picked wins)
-  handles: [], loHandles: [], nav: [], runDiff: null, hidden: new Map(), pv: null, navH: null, navSel: { del: true, link: true, snap: true }, navMsg: null, terra: { w: null, m: new Map(), undo: [] }, patchExtra: { w: null, m: new Map() },
+  handles: [], loHandles: [], nav: [], runDiff: null, hidden: new Map(), moved: new Map(), objUndo: [], pv: null, navH: null, navSel: { del: true, link: true, snap: true }, navMsg: null, terra: { w: null, m: new Map(), undo: [] }, patchExtra: { w: null, m: new Map() },
   cands: new Map(), meshState: new Map(), cover: new Map(), cityStatus: new Map(), worldCache: new Map(), bgToken: 0, bgText: '', badges: [], looseCands: new Map(), bsaCands: [], lazySources: [], assets: null, texRGB: new Map(), texReady: false, profiles: new Map(), profile: null, modlist: null, modlistName: '', dupInfo: null,
   loText: null, loName: '',
   headers: new Map(),
@@ -6896,8 +6972,13 @@ const V3 = createView3D($('#view3d'), {
   terraOnly: () => new Map(withTerra(null) || []),
   insideCity: () => !!S.W3,
   hiddenRefs: () => S.hidden,
-  hideRef: (r, name) => { S.hidden.set(r.key, { key: r.key, r, name }); },
-  unhideLast: () => { const k = [...S.hidden.keys()].pop(); if (k != null) S.hidden.delete(k); },
+  hideRef: (r, name) => { S.hidden.set(r.key, { key: r.key, r, name }); S.objUndo.push({ hide: r.key }); },
+  movedRefs: () => S.moved,
+  moveRef: (r, name, d) => { const was = S.moved.get(r.key) || null, m = was ? { ...was } : { key: r.key, r, name, dx: 0, dy: 0, dz: 0 }; m.dx += d.dx || 0; m.dy += d.dy || 0; m.dz += d.dz || 0; S.moved.set(r.key, m); S.objUndo.push({ move: r.key, was }); },
+  unhideLast: () => {      // undo the last disable or move
+    const u = S.objUndo.pop(); if (!u) { const k = [...S.hidden.keys()].pop(); if (k != null) S.hidden.delete(k); return; }
+    if (u.hide != null) S.hidden.delete(u.hide); else if (u.was) S.moved.set(u.move, u.was); else S.moved.delete(u.move);
+  },
   makeDisablePatch,
   parentCell: c => (S.W3 && S.W && S.W3 !== S.W) ? (S.W.cells.get(S.W.coordKey(c.x, c.y)) || null) : null,
   placeName: c => S.W3 && S.viewCity ? `${S.viewCity.name} — inside the city · ${c.x}, ${c.y}` : `${TSI.prettyWorld(S.W.world.edid || '')} ${c.x}, ${c.y}${c.edid ? ' · ' + c.edid : ''}`,
@@ -7006,7 +7087,7 @@ function makeSeamPatch() {
   else {
     savePatch([{ name, bytes: r.bytes }], zipOf(name));
     const skipped = list.length - r.fixed;
-    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}.<ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
+    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}.<ol style="margin:6px 0 0 18px;padding:0">${r.replaces && r.replaces.length ? `<li><b>It also holds everything from your earlier ${r.replaces.map(esc).join(', ')}</b> (${r.carried} cell${r.carried === 1 ? '' : 's'} carried over), so it <b>replaces</b> ${r.replaces.length > 1 ? 'them' : 'it'}: install it over the old one (MO2: same name → Replace) or switch the old one off. Keep only one.</li>` : ''}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
   }
   S.patchMsg = { w: W, h: hmsg };
   return hmsg;
@@ -7046,7 +7127,9 @@ function navCmd(world, x, y, edid) {
 }
 const NAV_KIND = { gone: 'to a navmesh that is not in your load order', range: 'to a triangle that does not exist', aim: 'to the wrong triangle', oneway: 'not answered from the other side' };
 // The mods each navmesh problem involves (the game's own files are never "the" mod), to make a patch for some mods only
-function navMods(kind, x) { const ps = kind === 'del' ? [x.by] : kind === 'pair' ? [x.pa, x.pb] : [x.landP, x.navP, x.refP]; return ps.filter(p => p >= 0 && S.ctx.plugins[p] && !S.ctx.plugins[p].baseline); }
+// the game's own files (Skyrim.esm, Update, the DLCs) count as one choice, -1 "Base game & DLC"
+const NAV_BASE = -1, navModName = p => p === NAV_BASE ? 'Base game and DLC' : P(p).name;
+function navMods(kind, x) { const ps = kind === 'del' ? [x.by] : kind === 'pair' ? [x.pa, x.pb] : [x.landP, x.navP, x.refP]; return [...new Set(ps.filter(p => p >= 0 && S.ctx.plugins[p]).map(p => S.ctx.plugins[p].baseline ? NAV_BASE : p))]; }
 function navPick() { const m = S.navMods && S.navMods.w === S.W ? S.navMods.set : null; return m && m.size ? m : null; }
 function navFiltered() {
   const NH = navRes(), m = navPick(), ok = (k, x) => !m || navMods(k, x).some(p => m.has(p));
@@ -7054,32 +7137,34 @@ function navFiltered() {
 }
 async function makeNavPatch() {
   const W = S.W, F = navFiltered(), sel = S.navSel;
-  const plan = { restore: sel.del ? F.del.filter(d => d.fixable) : [], pairs: sel.link ? F.pairs : [], snap: sel.snap && F.nav.length ? F.nav : false, only: F.mods || null };
+  const plan = { restore: sel.del ? F.del.filter(d => d.fixable) : [], pairs: sel.link ? F.pairs : [], snap: sel.snap && F.nav.length ? F.nav : false, only: F.mods ? new Set([...F.mods].filter(p => p !== NAV_BASE)) : null };
   let r; try { r = await TSI.buildNavPatch(S.ctx, W, plan, readRec); } catch (e) { r = { bytes: null, error: e.message || String(e), skipped: [] }; }
   const why = r.skipped && r.skipped.length ? [...new Set(r.skipped.map(x => x.why))].slice(0, 3).join('; ') : '';
   let h;
   if (!r.bytes) h = `<div class="errbox" style="margin-top:8px">No navmesh patch could be made${r.error ? ` (${esc(r.error)})` : why ? `: ${esc(why)}` : ': nothing here can be corrected safely'}.</div>`;
   else {
-    const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), one = F.mods && F.mods.size === 1 ? P([...F.mods][0]).name.replace(/\.es[pml]$/i, '').replace(/[^\w -]/g, '').slice(0, 60) : '';
+    const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), one = F.mods && F.mods.size === 1 ? navModName([...F.mods][0]).replace(/\.es[pml]$/i, '').replace(/[^\w -]/g, '').slice(0, 60) : '';
     const name = `Terrain Inspector - Navmesh Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}${one ? ' - ' + one : F.mods ? ` - ${F.mods.size} mods` : ''}.esp`, c = r.count;
     savePatch([{ name, bytes: r.bytes }], zipOf(name));
     const did = [c.restored && `${c.restored} deleted navmesh${c.restored > 1 ? 'es' : ''} brought back and parked below the ground`,
       c.relinked && `${c.relinked} navmesh${c.relinked > 1 ? 'es' : ''} re-linked (${[c.fixed && c.fixed + ' links corrected', c.added && c.added + ' added', c.cut && c.cut + (c.cut > 1 ? ' dead ones cut' : ' dead one cut')].filter(Boolean).join(', ')})`,
       c.snapped && `${c.snapped} put back on the ground`].filter(Boolean).join('; ');
     h = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${did}${r.skipped.length ? `. ${r.skipped.length} left out (${esc(why)})` : ''}${c.held ? `. ${c.held} neighbouring navmesh${c.held > 1 ? 'es' : ''} from mods you did not pick ${c.held > 1 ? 'were' : 'was'} left as ${c.held > 1 ? 'they are' : 'it is'}: their side gets fixed in their own patch` : ''}.
-      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li>${F.mods ? `<li>Put it <b>right after ${esc([...F.mods, ...S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)].sort((a, b) => b - a).map(i => P(i).name)[0])}</b>, <b>not at the end</b>: it only depends on the mods you picked and the game, and holds their cells as those mods left them, so your later mods' cell changes (water, lighting…) must still load after it.` : `<li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes).`} ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
+      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li>${F.mods ? `<li>Put it <b>right after ${esc([...F.mods].filter(p => p !== NAV_BASE).concat(S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)).sort((a, b) => b - a).map(i => P(i).name)[0] || r.after)}</b>, <b>not at the end</b>: it only depends on the mods you picked and the game, and holds their cells as those mods left them, so your later mods' cell changes (water, lighting…) must still load after it.` : `<li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes).`} ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
       <div class="muted" style="margin-top:6px">This is the tool's newest and least proven kind of patch. Go to one of these places in game and watch an NPC or follower walk there before you keep it. Removing the plugin undoes everything. Make a new one when your load order changes.</div></div>`;
   }
   S.navMsg = { w: W, h };
   return h;
 }
 async function makeDisablePatch() {
-  let r; try { r = await TSI.buildDisablePatch(S.ctx, [...S.hidden.values()], readRec); } catch (e) { return `<div class="errbox">No patch could be made (${esc(e.message || String(e))}).</div>`; }
+  const items = [...S.hidden.values(), ...[...S.moved.values()].filter(m => !S.hidden.has(m.key)).map(m => ({ key: m.key, r: m.r, move: { dx: m.dx, dy: m.dy, dz: m.dz } }))];
+  let r; try { r = await TSI.buildDisablePatch(S.ctx, items, readRec); } catch (e) { return `<div class="errbox">No patch could be made (${esc(e.message || String(e))}).</div>`; }
   if (!r.files.length) return `<div class="errbox">No patch could be made: these objects' records couldn't be read back from your plugins.</div>`;
   const one = r.files.length === 1, name = savePatch(r.files, one ? zipOf(r.files[0].name) : 'Terrain Inspector - Disabled objects.zip');
-  const n = r.files.reduce((t, f) => t + f.count, 0);
-  return `<div class="okbox"><b>${esc(name)}</b> downloaded: ${n} object${n > 1 ? 's' : ''} switched off${r.skipped.length ? `, ${r.skipped.length} skipped (record not readable)` : ''}.` +
-    (one ? '' : `<div style="margin-top:4px">It holds ${r.files.length} small plugins, one per mod the objects come from (${r.files.map(f => esc(f.from)).join(', ')}): each object's record is copied untouched from its own mod, which is the safe way.</div>`) +
+  const n = r.files.reduce((t, f) => t + f.count, 0), nm = r.files.reduce((t, f) => t + (f.moved || 0), 0), off = n - nm;
+  return `<div class="okbox"><b>${esc(name)}</b> downloaded: ${[off && `${off} object${off > 1 ? 's' : ''} switched off`, nm && `${nm} moved`].filter(Boolean).join(', ')}${r.skipped.length ? `, ${r.skipped.length} skipped (record not readable)` : ''}.` +
+    (r.replaces && r.replaces.length ? `<div style="margin-top:4px"><b>It also holds the ${r.carried} object${r.carried === 1 ? '' : 's'} of your earlier ${r.replaces.map(esc).join(', ')}</b>, so it replaces ${r.replaces.length > 1 ? 'them' : 'it'}: once this one is installed, switch the old one${r.replaces.length > 1 ? 's' : ''} off. Keep only these.</div>` : '') +
+    (one ? '' : `<div style="margin-top:4px">It holds ${r.files.length} plugins: the main one, plus a small one per mod for objects whose data could not be merged (${r.files.slice(1).map(f => esc(f.from)).join(', ')}).</div>`) +
     `<ol style="margin:6px 0 0 18px;padding:0">${INST}` +
     `<li><b>Load order matters here:</b> in your plugin list, put the patch <b>below ${esc(r.files[0].from)}</b>${one ? '' : ` (${r.files.length - 1 > 1 ? 'the extra plugins named after a mod go' : 'the extra plugin named after a mod goes'} below that mod: those objects carry data that could not be merged)`}. That is the last plugin that touches these objects: any plugin under the patch that also edits them wins, and the objects come back. ESL-flagged: no plugin slot used.</li>` +
     `<li><b>Check it here:</b> load your list in this tool again. The objects should be gone from the 3D view. If they are still there, a plugin below the patch overrides them: move the patch lower.</li>` +
@@ -7193,7 +7278,7 @@ function renderPane() {
         const m = F.mods, list = [...cnt].sort((a, b) => a[0] - b[0]);
         return `<details class="navmods" ${S.navModsOpen ? 'open' : ''}><summary>${m ? `<b>Only for ${m.size} mod${m.size > 1 ? 's' : ''}</b>` : 'For all mods'} · pick mods to make a patch just for them</summary>
           <div class="muted" style="font-size:12px;margin:4px 0">Tick the mods (or a group of them) to patch now. The list and the patch keep only the problems those mods are part of.</div>
-          <div class="navmodlist">${list.map(([p, n]) => `<label><input type="checkbox" data-nm="${p}" ${m && m.has(p) ? 'checked' : ''}> ${esc(P(p).name)} <span class="muted">(${n})</span></label>`).join('')}</div>
+          <div class="navmodlist">${list.map(([p, n]) => `<label><input type="checkbox" data-nm="${p}" ${m && m.has(p) ? 'checked' : ''}> ${p === NAV_BASE ? '<b>Base game &amp; DLC</b>' : esc(P(p).name)} <span class="muted">(${n})</span></label>`).join('')}</div>
           ${m ? '<button class="small" id="nmAll">Back to all mods</button>' : ''}</details>`;
       })()}
       <div id="navMsg">${S.navMsg && S.navMsg.w === W ? S.navMsg.h : ''}</div></div>`;
