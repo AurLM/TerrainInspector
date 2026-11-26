@@ -739,9 +739,9 @@ function parsePlugin(ctx, name, buf, loadIndex) {
       if (world == null || !inBlock) return; // skip the world's persistent cell
       const key = resolve(p, raw);
       const b = recordBody(u8, dv, off, size, flags);
-      let cx = null, cy = null, dflags = 0, water = null, edid = '', loc = -1;
+      let cx = null, cy = null, hideQ = 0, dflags = 0, water = null, edid = '', loc = -1;
       forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
-        if (t === TY.XCLC && l >= 8) { cx = b.dv.getInt32(o, true); cy = b.dv.getInt32(o + 4, true); }
+        if (t === TY.XCLC && l >= 8) { cx = b.dv.getInt32(o, true); cy = b.dv.getInt32(o + 4, true); if (l >= 12) hideQ = b.u8[o + 8] & 15; }   // flags 1/2/4/8: the game hides that quarter of the ground
         else if (t === TY.XLCN && l >= 4) loc = resolve(p, b.dv.getUint32(o, true));
         else if (t === TY.DATA && l >= 1) dflags = b.u8[o];
         else if (t === TY.XCLW && l >= 4) water = b.dv.getFloat32(o, true);
@@ -754,7 +754,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
       const hasWater = !!(dflags & 2);
       if (water !== null && (!isFinite(water) || Math.abs(water) > 1e8)) water = null; // sentinel: the cell uses the worldspace's default water height
       let arr = ctx.cellVers.get(key); if (!arr) ctx.cellVers.set(key, arr = []);
-      arr.push({ p: p.idx, hasWater, water, deleted: !!(flags & FLAG_DELETED) });
+      arr.push({ p: p.idx, hasWater, water, hideQ, deleted: !!(flags & FLAG_DELETED) });
       p.counts.cells++;
       return;
     }
@@ -764,7 +764,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
       const w = ctx.worlds.get(key) || { key, edid: '', defaultWater: 0, defaultLand: -2048, parent: null };
       forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
         if (t === TY.EDID) w.edid = zstr(b.u8, o, o + l);
-        else if (t === TY.DNAM && l >= 8) { w.defaultLand = b.dv.getFloat32(o, true); w.defaultWater = b.dv.getFloat32(o + 4, true); }
+        else if (t === TY.DNAM && l >= 8) { w.defaultLand = b.dv.getFloat32(o, true); w.defaultWater = b.dv.getFloat32(o + 4, true); w.hasDnam = true; }
         else if (t === TY.WNAM && l >= 4) w.parent = resolve(p, b.dv.getUint32(o, true));
         else if (t === TY.PNAM && l >= 2) w.useFlags = b.dv.getUint16(o, true);
         else if (t === TY.XLCN && l >= 4) w.loc = resolve(p, b.dv.getUint32(o, true));
@@ -873,9 +873,11 @@ function parsePlugin(ctx, name, buf, loadIndex) {
         else if (isScol && t === TY.ONAM && l >= 4) { cur = { base: resolve(p, b.dv.getUint32(o, true)), at: [] }; (parts || (parts = [])).push(cur); }
         else if (isScol && t === TY.DATA && cur) for (let q = o; q + 28 <= o + l; q += 28) cur.at.push([0, 1, 2, 3, 4, 5, 6].map(i => b.dv.getFloat32(q + i * 4, true)));
       });
-      const marker = !parts && (/marker/i.test(model) || /marker/i.test(edid) || model === '' || /^(effects|fx)[\\/]|[\\/]fx|^fx/i.test(model) || /^fx/i.test(edid) ||
+      // effects (waterfalls, smoke, steam, mist, fire): kept, so they can be seen and switched off with the object they belong to
+      const fx = !parts && model !== '' && !/marker/i.test(model) && !/marker/i.test(edid) && type !== TY.LIGH && !/^critters[\\/]|beehive/i.test(model) && (/^(effects|fx)[\\/]|[\\/]fx|^fx/i.test(model) || /^fx/i.test(edid));   // a hawk's nest named FX… is a critter, not an effect
+      const marker = !parts && !fx && (/marker/i.test(model) || /marker/i.test(edid) || model === '' || /^(effects|fx)[\\/]|[\\/]fx|^fx/i.test(model) || /^fx/i.test(edid) ||
         (type === TY.MISC) || (type === TY.LIGH && !model));   // loose items are clutter, not structures
-      ctx.baseInfo.set(key, { t: tstr(type), edid, model, marker, bounds, parts });
+      ctx.baseInfo.set(key, { t: tstr(type), edid, model, marker, fx, bounds, parts });
     }
   };
 
@@ -994,10 +996,11 @@ function decodeLand(ctx, v) {
       out.heights = h;
     } else if (t === TY.VNML && l >= NP * 3) out.normals = new Int8Array(u8.buffer.slice(u8.byteOffset + o, u8.byteOffset + o + NP * 3));
     else if (t === TY.VCLR && l >= NP * 3) out.colors = u8.slice(o, o + NP * 3);
-    else if (t === TY.BTXT && l >= 5) { const q = u8[o + 4] & 3; out.base[q] = resolve(p, dv.getUint32(o, true)); }
+    else if (t === TY.BTXT && l >= 5) { const q = u8[o + 4] & 3, raw = dv.getUint32(o, true); out.base[q] = raw ? resolve(p, raw) : -1; }   // 0: the engine's standard ground (dirt02)
     else if (t === TY.ATXT && l >= 8) {
       const q = u8[o + 4] & 3;
-      curLayer = { tex: resolve(p, dv.getUint32(o, true)), layer: dv.getUint16(o + 6, true), op: new Float32Array(289) };
+      const rawT = dv.getUint32(o, true);   // 0: the engine's standard ground (dirt02), as for the base texture
+      curLayer = { tex: rawT ? resolve(p, rawT) : -1, layer: dv.getUint16(o + 6, true), op: new Float32Array(289) };
       out.layers[q].push(curLayer);
     } else if (t === TY.VTXT && curLayer) {
       for (let i = 0; i + 8 <= l; i += 8) {
@@ -1007,9 +1010,212 @@ function decodeLand(ctx, v) {
     }
   });
   for (const L of out.layers) L.sort((a, b) => a.layer - b.layer);
+  // The game draws at most 6 different textures per quarter (the base and 5 more, in layer order); layers past that are not
+  // drawn at all. `layers` is what the game shows, `layersAll` what the plugin holds.
+  out.layersAll = out.layers;
+  out.layers = out.layersAll.map((Ls, q) => {
+    const seen = new Set([texCompareKey(ctx, out.base[q])]), kept = [];
+    for (const L of Ls) { const k = texCompareKey(ctx, L.tex); if (seen.has(k) || seen.size < GAME_TEX_PER_QUAD) { seen.add(k); kept.push(L); } }
+    return kept;
+  });
   return out;
 }
+const GAME_TEX_PER_QUAD = 6;
 
+// The texture mix at point k (0..1088) of a decoded LAND, keyed by texture record (-1 = the engine's standard ground, dirt02).
+function mixOfDecoded(d, k) {
+  const r = Math.floor(k / 33), q = k % 33, top = r > 16, right = q > 16, qd = (top ? 2 : 0) + (right ? 1 : 0), pos = (top ? r - 16 : r) * 17 + (right ? q - 16 : q);
+  const w = new Map([[d.base[qd] < 0 ? -1 : d.base[qd], 1]]);
+  for (const L of d.layers[qd]) { const op = L.op[pos]; if (!(op > 0)) continue; const o = Math.min(1, op), lt = L.tex < 0 ? -1 : L.tex; for (const [t, v] of w) w.set(t, v * (1 - o)); w.set(lt, (w.get(lt) || 0) + o); }
+  return w;
+}
+// The mix at point k from every layer the plugin holds (what its author made), and from the layers the game draws.
+function mixAll(d, k) { return mixOfDecoded(d.layersAll ? Object.assign({}, d, { layers: d.layersAll }) : d, k); }
+/* ---------- too many textures: a quarter with more than 6 textures, so the game leaves some out ----------
+   It shows in game as a quarter with different ground and hard straight edges; the 3D view now draws it the same way.
+   Listed only where it shows (the left-out layers change the ground by 15%+ on 3+ points). Returns [{x, y, quads: {q: points}, n, by, tex}]. */
+async function textureOverflow(ctx, W, tick) {
+  const out = []; let n = 0; const cells = [...W.cells.values()].filter(c => c.winner && !c.ghost && !c.city);
+  for (const c of cells) {
+    if (tick && ++n % 200 === 0) await tick(n, cells.length);
+    let d; try { d = decodeLand(ctx, c.winner); } catch (e) { continue; }
+    if (!d || !d.heights || !d.layersAll) continue;
+    const quads = {}, tex = new Set(); let tot = 0;
+    for (let q = 0; q < 4; q++) {
+      if (d.layersAll[q].length === d.layers[q].length) continue;
+      const r0 = q & 2 ? 16 : 0, c0 = q & 1 ? 16 : 0; let bad = 0;
+      for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+        const k = (r0 + lr) * 33 + c0 + lc, a = mixAll(d, k), b = mixOfDecoded(d, k); let df = 0;
+        for (const t of new Set([...a.keys(), ...b.keys()])) df += Math.abs((a.get(t) || 0) - (b.get(t) || 0));
+        if (df / 2 >= 0.15) bad++;
+      }
+      if (bad >= 3) { quads[q] = bad; tot += bad; for (const L of d.layersAll[q]) if (!d.layers[q].includes(L)) tex.add(texName(ctx, L.tex)); }
+    }
+    if (tot) out.push({ x: c.x, y: c.y, quads, n: tot, by: c.winner.p, tex: [...tex] });
+  }
+  return out;
+}
+/* Cells of an earlier ground patch from this tool written by its old versions, whose texture data is not in the standard
+   quarter-by-quarter order (a new patch writes them again in order). Returns the number of such cells. */
+function ownPatchOrder(ctx, W) {
+  let n = 0;
+  for (const c of W.cells.values()) {
+    if (!c.winner || !ctx.plugins[c.winner.p].ownGround) continue;
+    let u8; try { u8 = landBody(c.winner); } catch (e) { continue; }
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength); let lastQ = -1, lastN = -1, bad = false;
+    forEachSub(u8, dv, 0, u8.length, (t, o, l) => {
+      if (l < 5 || (t !== TY.BTXT && t !== TY.ATXT)) return;
+      const q = u8[o + 4] & 3, nn = t === TY.ATXT && l >= 8 ? dv.getUint16(o + 6, true) : -1;
+      if (q < lastQ || (q === lastQ && nn <= lastN)) { bad = true; return false; }
+      lastQ = q; lastN = nn;
+    });
+    if (bad) n++;
+  }
+  return n;
+}
+// The mix at one point of one quarter, from its own data (every layer the plugin holds).
+function quarterMix(d, qd, lr, lc) {
+  const pos = lr * 17 + lc, m = new Map([[d.base[qd] < 0 ? -1 : d.base[qd], 1]]);
+  for (const L of (d.layersAll || d.layers)[qd]) { const op = L.op[pos]; if (!(op > 0)) continue; const o = Math.min(1, op), lt = L.tex < 0 ? -1 : L.tex; for (const [t, v] of m) m.set(t, v * (1 - o)); m.set(lt, (m.get(lt) || 0) + o); }
+  return m;
+}
+// The other copy of a point on the line between quarters: the one in the lower / left quarter.
+function otherCopy(d, qd, lr, lc) { const top = qd & 2 && lr === 0, right = qd & 1 && lc === 0; return quarterMix(d, (top ? 0 : qd & 2) | (right ? 0 : qd & 1), top ? 16 : lr, right ? 16 : lc); }
+const mixDiff = (a, b) => { let d = 0; for (const t of new Set([...a.keys(), ...b.keys()])) d += Math.abs((a.get(t) || 0) - (b.get(t) || 0)); return d / 2; };
+/* Quarter edges an earlier ground patch of ours overwrote: on the line between two quarters (stored in both, drawn by the game
+   from each quarter's own copy) the plugin under the patch had two different copies, and the patch wrote the lower/left one
+   into both. Returns Map(cell -> Map(qd -> Map(point -> the original copy))). */
+function ownEdgeLost(ctx, W) {
+  const out = new Map();
+  for (const c of W.cells.values()) {
+    if (!c.winner || !ctx.plugins[c.winner.p].ownGround || !c.lands) continue;
+    const src = [...c.lands].reverse().find(v => !ctx.plugins[v.p].ownGround); if (!src) continue;
+    let a, b; try { a = decodeLand(ctx, c.winner); b = decodeLand(ctx, src); } catch (e) { continue; }
+    for (let qd = 1; qd < 4; qd++) for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+      if (!((qd & 2 && lr === 0) || (qd & 1 && lc === 0))) continue;
+      const pm = quarterMix(a, qd, lr, lc), po = otherCopy(a, qd, lr, lc), sm = quarterMix(b, qd, lr, lc), so = otherCopy(b, qd, lr, lc);
+      // the patch's copies are the same, the original's were not: the quarter's own copy comes back, with the same (small) change the
+      // patch made to the other copy (a big change there, such as a brush stroke, was meant for both and stays)
+      // or: the patch's copy is something else than the original's, while the point next to it inside the quarter is unchanged; no seam
+      // fix or brush stroke changes a single line of points inside a cell, so that is left over from an older version: original back
+      const inR = qd & 2 && lr === 0 ? 1 : lr, inC = qd & 1 && lc === 0 ? 1 : lc;
+      if (mixDiff(pm, sm) >= 0.2 && mixDiff(quarterMix(a, qd, inR, inC), quarterMix(b, qd, inR, inC)) < 0.05 && !(mixDiff(pm, po) < 0.05 && mixDiff(sm, so) >= 0.2 && mixDiff(po, so) <= 0.5)) {
+        const isBorder = (qd & 1 && lc === 16) || (qd & 2 && lr === 16) || (!(qd & 1) && lc === 0) || (!(qd & 2) && lr === 0);
+        if (!isBorder) { let m = out.get(c); if (!m) out.set(c, m = new Map()); let q = m.get(qd); if (!q) m.set(qd, q = new Map()); q.set(lr * 17 + lc, sm); }
+        continue;
+      }
+      if (mixDiff(pm, po) < 0.05 && mixDiff(sm, so) >= 0.2 && mixDiff(po, so) <= 0.5) {
+        const fx = new Map(); let tot = 0;
+        for (const t of new Set([...sm.keys(), ...po.keys(), ...so.keys()])) { const v = Math.max(0, (sm.get(t) || 0) + (po.get(t) || 0) - (so.get(t) || 0)); if (v > 0) { fx.set(t, v); tot += v; } }
+        if (tot > 0) for (const [t, v] of fx) fx.set(t, v / tot);
+        let m = out.get(c); if (!m) out.set(c, m = new Map()); let q = m.get(qd); if (!q) m.set(qd, q = new Map()); q.set(lr * 17 + lc, fx);
+      }
+    }
+  }
+  return out;
+}
+/* Quarters an earlier ground patch of ours rebuilt with another layout than the plugin under it (another base texture, other
+   layers or another layer order). The game does not always draw a rebuilt quarter like the original, so a new patch lays them out
+   again in the original's layout. Returns [{x, y, quads: [q...]}]. */
+function ownRebuilt(ctx, W) {
+  const out = [];
+  const sig = (d, q) => [d.base[q] < 0 ? -1 : d.base[q], ...(d.layersAll || d.layers)[q].slice().sort((a, b) => a.layer - b.layer).map(L => L.tex < 0 ? -1 : L.tex)].join(',');
+  for (const c of W.cells.values()) {
+    if (!c.winner || !ctx.plugins[c.winner.p].ownGround || !c.lands) continue;
+    const src = [...c.lands].reverse().find(v => !ctx.plugins[v.p].ownGround); if (!src) continue;
+    let a, b; try { a = decodeLand(ctx, c.winner); b = decodeLand(ctx, src); } catch (e) { continue; }
+    if (!a.heights || !b.heights) continue;
+    // the original's base and layers, in order, still at the start: the same layout (a texture added on top for a blend is fine)
+    const quads = []; for (let q = 0; q < 4; q++) { const sa = sig(a, q), sb = sig(b, q); if (!(sa === sb || sa.startsWith(sb + ','))) quads.push(q); }
+    if (quads.length) out.push({ x: c.x, y: c.y, quads });
+  }
+  return out;
+}
+/* Quarters of cells in an earlier ground patch of ours that lost their base texture: the plugin under the patch had one there,
+   the patch has none (older versions did this when the game's standard ground got into the mix). In game such a quarter shows
+   as a hard-edged patch of dirt02. Returns [{x, y, quads: [q...], from}]; a new patch puts the base texture back. */
+function ownBaseLost(ctx, W) {
+  const out = [];
+  for (const c of W.cells.values()) {
+    if (!c.winner || !ctx.plugins[c.winner.p].ownGround || !c.lands) continue;
+    const src = [...c.lands].reverse().find(v => !ctx.plugins[v.p].ownGround); if (!src) continue;
+    let a, b; try { a = decodeLand(ctx, c.winner); b = decodeLand(ctx, src); } catch (e) { continue; }
+    const quads = []; for (let q = 0; q < 4; q++) if (a.base[q] < 0 && b.base[q] >= 0) quads.push(q);
+    if (quads.length) out.push({ x: c.x, y: c.y, quads, from: src.p });
+  }
+  return out;
+}
+/* ---------- texture holes: the standard ground (dirt02) shows where an earlier version of the same cell had real textures ----------
+   That is a texture a later mod or patch lost (a quarter-cell without its base texture, or a layer gone), and it shows in game as a
+   hard-edged patch of dirt02. Ground that was always dirt02 in every earlier version is not reported. Returns
+   [{x, y, n, by, from}]: n points, `by` the plugin that has the hole, `from` the last plugin whose version had real textures there. */
+async function textureHoles(ctx, W, tick) {
+  // Point by point: a point is "lost" when the winner shows at least 0.25 more standard ground than an earlier version did.
+  // Thin streaks and soft spots count too, not only solid patches. The source is the earlier version with the least standard ground there.
+  const out = []; let n = 0; const cells = [...W.cells.values()].filter(c => c.winner && !c.ghost && !c.city && c.lands && c.lands.length > 1);
+  for (const c of cells) {
+    if (tick && ++n % 100 === 0) await tick(n, cells.length);
+    let d; try { d = decodeLand(ctx, c.winner); } catch (e) { continue; }
+    if (!d || !d.heights) continue;
+    const now = new Float32Array(1089), pts = [];
+    for (let k = 0; k < 1089; k++) { now[k] = mixOfDecoded(d, k).get(-1) || 0; if (now[k] >= 0.25) pts.push(k); }
+    if (pts.length < 3) continue;
+    let best = -1, bestLost = 0, bestPts = 0;
+    for (let i = c.lands.length - 2; i >= 0; i--) {
+      let e; try { e = decodeLand(ctx, c.lands[i]); } catch (er) { continue; }
+      if (!e || !e.heights) continue;
+      let lost = 0, np = 0; for (const k of pts) { const g = now[k] - (mixOfDecoded(e, k).get(-1) || 0); if (g >= 0.25) { lost += g; np++; } }
+      if (np >= 3 && lost > bestLost + 1e-6) { best = i; bestLost = lost; bestPts = np; }
+    }
+    if (best < 0) continue;           // as much standard ground in every earlier version: as designed
+    let by = c.lands.length - 1;      // the first version after `best` that shows it
+    for (let i = best + 1; i < c.lands.length; i++) { let e; try { e = decodeLand(ctx, c.lands[i]); } catch (er) { continue; } let h = 0; for (const k of pts) if ((mixOfDecoded(e, k).get(-1) || 0) >= now[k] - 0.1) h++; if (h >= pts.length * 0.8) { by = i; break; } }
+    out.push({ x: c.x, y: c.y, n: bestPts, by: c.lands[by].p, from: c.lands[best].p });
+  }
+  return out;
+}
+/* ---------- texture / colour lines: the heights meet, but what each cell stores on the shared border points does not ----------
+   Every point on a cell border exists in both cells. If one cell says "60% snow" and the other "0%", or their shading colours
+   differ, the game draws a straight line there. Returns [{a, b, dir, tex, col, pa, pb}] (tex: 0..1 share of the mix that
+   differs, col: largest colour difference 0..255). */
+function borderSig(ctx, c) {
+  const d = decodeLand(ctx, c.winner); if (!d || !d.heights) return null;
+  const mixK = k => {
+    const r = Math.floor(k / 33), q = k % 33, top = r > 16, right = q > 16, qd = (top ? 2 : 0) + (right ? 1 : 0), pos = (top ? r - 16 : r) * 17 + (right ? q - 16 : q);
+    // compared by what the texture looks like (its image), not by its record: several records often share one image
+    const w = new Map([[texCompareKey(ctx, d.base[qd]), 1]]);
+    for (const L of d.layers[qd]) { const op = L.op[pos]; if (!(op > 0)) continue; const o = Math.min(1, op), lt = texCompareKey(ctx, L.tex); for (const [t, v] of w) w.set(t, v * (1 - o)); w.set(lt, (w.get(lt) || 0) + o); }
+    return w;
+  };
+  const side = ks => ks.map(k => ({ w: mixK(k), c: d.colors ? [d.colors[k * 3], d.colors[k * 3 + 1], d.colors[k * 3 + 2]] : [255, 255, 255] }));
+  const R33 = [...Array(33).keys()];
+  return { E: side(R33.map(i => i * 33 + 32)), W: side(R33.map(i => i * 33)), N: side(R33.map(i => 32 * 33 + i)), S: side(R33.map(i => i)) };
+}
+async function surfaceSeams(ctx, W, tick) {
+  const sig = new Map(), out = [], cells = [...W.cells.values()].filter(c => c.winner && !c.ghost && !c.city);
+  const get = c => { if (!sig.has(c)) { let s2 = null; try { s2 = borderSig(ctx, c); } catch (e) { } sig.set(c, s2); } return sig.get(c); };
+  let n = 0;
+  for (const c of cells) {
+    if (tick && ++n % 200 === 0) await tick(n, cells.length);
+    for (const [dir, dx, dy, mine, theirs] of [['E', 1, 0, 'E', 'W'], ['N', 0, 1, 'N', 'S']]) {
+      const o = W.cells.get(W.coordKey(c.x + dx, c.y + dy)); if (!o || !o.winner || o.ghost || o.city) continue;
+      if (ctx.plugins[c.winner.p].baseline && ctx.plugins[o.winner.p].baseline) continue;     // the unmodded game's own borders: not a mod problem
+      const A = get(c), B = get(o); if (!A || !B) continue;
+      let tex = 0, col = 0, texPts = 0, colPts = 0, texRun = 0, colRun = 0;
+      for (let i = 0; i <= 32; i++) {
+        const a = A[mine][i], b = B[theirs][i];
+        let dsum = 0; for (const t of new Set([...a.w.keys(), ...b.w.keys()])) dsum += Math.abs((a.w.get(t) || 0) - (b.w.get(t) || 0));
+        const dt = dsum / 2, dc = Math.max(Math.abs(a.c[0] - b.c[0]), Math.abs(a.c[1] - b.c[1]), Math.abs(a.c[2] - b.c[2]));
+        if (dt > tex) tex = dt; if (dc > col) col = dc;
+        // a line shows where several points in a row clearly disagree; a few scattered ones blur away
+        texRun = dt > 0.35 ? texRun + 1 : 0; colRun = dc > 20 ? colRun + 1 : 0;
+        if (texRun > texPts) texPts = texRun; if (colRun > colPts) colPts = colRun;
+      }
+      if (texPts >= 3 || colPts >= 3) out.push({ a: { x: c.x, y: c.y }, b: { x: o.x, y: o.y }, dir, tex: texPts >= 3 ? tex : 0, col: colPts >= 3 ? col : 0, pa: c.winner.p, pb: o.winner.p });
+    }
+  }
+  return out;
+}
 // The ground textures at one point of a cell, strongest first: [[ltexKey (-1 = default dirt), weight], ...]
 function texMixAt(ctx, W, wx, wy) {
   const c = W.cells.get(W.coordKey(Math.floor(wx / 4096), Math.floor(wy / 4096))); if (!c || !c.winner) return [];
@@ -1039,8 +1245,9 @@ function internTex(ctx, k) {
   if (i === undefined) { i = ctx.texNames.length; ctx.texNames.push(k); ctx.texIntern.set(k, i); }
   return i;
 }
-function texWeightsAt(ctx, d, r, c) {
-  const top = r > 16, right = c > 16;
+function texWeightsAt(ctx, d, r, c, n = 3, qForce = -1) {
+  // a point on the line between quarters is stored in both; qForce picks which quarter's copy (default: the lower / left one)
+  const top = qForce >= 0 ? (qForce & 2) > 0 : r > 16, right = qForce >= 0 ? (qForce & 1) > 0 : c > 16;
   const q = (top ? 2 : 0) + (right ? 1 : 0);
   const lr = top ? r - 16 : r, lc = right ? c - 16 : c;
   const pos = lr * 17 + lc;
@@ -1053,7 +1260,7 @@ function texWeightsAt(ctx, d, r, c) {
     const k = internTex(ctx, texCompareKey(ctx, L.tex));
     w.set(k, (w.get(k) || 0) + Math.min(1, op));
   }
-  return [...w].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  return [...w].sort((a, b) => b[1] - a[1]).slice(0, n);
 }
 /** Extract edge data: sides S,N,W,E with 33 points each (compact typed arrays). */
 function extractEdges(ctx, d) {
@@ -1256,7 +1463,8 @@ async function analyzeWorld(ctx, worldKey, progress, rgbOf) {
   // 1b. a child worldspace (city) that borrows its parent's land, or shows it around its own cells as context
   const wrec = ctx.worlds.get(worldKey);
   // "Use Land Data" / "Use Water Data" inherit the parent's default land / water HEIGHTS (DNAM), not its landscape
-  if (wrec && wrec.parent != null && (wrec.useFlags & 9) && ctx.worlds.get(wrec.parent)) W.world = Object.assign({}, wrec, { defaultWater: ctx.worlds.get(wrec.parent).defaultWater });
+  // the parent's default water: with "Use Water Data" (0x08), or when the world has no default heights of its own (RiftenWorld)
+  if (wrec && wrec.parent != null && ((wrec.useFlags & 8) || !wrec.hasDnam) && ctx.worlds.get(wrec.parent)) W.world = Object.assign({}, wrec, { defaultWater: ctx.worlds.get(wrec.parent).defaultWater });
   if (wrec && wrec.parent != null && W.cells.size) {
     // "Use Land Data" (PNAM 0x01): the city shows its parent's (Tamriel's) landscape, with every landscape mod; its own LAND
     // copies are not what the game draws. Without the flag, the city keeps its own landscape and the parent's only surrounds it.
@@ -1443,6 +1651,8 @@ function findSeams(ctx, W, opts) {
       const nb = W.cells.get(W.coordKey(c.x + (dir === 'E' ? 1 : 0), c.y + (dir === 'N' ? 1 : 0)));
       if (!nb || !nb.winner) continue;
       if (c.city || nb.city || c.ghost || nb.ghost) continue; // checked in the city's own worldspace
+      { const hA = (c.cellWin && c.cellWin.hideQ) || 0, hB = (nb.cellWin && nb.cellWin.hideQ) || 0, mA = dir === 'E' ? 10 : 12, mB = dir === 'E' ? 5 : 3;
+        if ((hA & mA) === mA || (hB & mB) === mB) continue; }   // the game hides the ground on one side of this border (a city's own street model is there): nothing to see
       const pa = ctx.plugins[c.winner.p], pb = ctx.plugins[nb.winner.p];
       if (pa.baseline && pb.baseline && !opts.showVanilla) continue;
       const raw = pairMetricsDry(W, c, nb, c.winner, nb.winner, dir);
@@ -1538,7 +1748,18 @@ function findWaterSeams(ctx, W, opts) {
       if (ea && ea.h) minEdge = Math.min(...ea.h);
       if (minEdge > Math.max(wa, wb)) continue;
       const changedA = ba == null || Math.abs(ba - wa) > 1, changedB = bb == null || Math.abs(bb - wb) > 1;
-      out.push({ a: c, b: nb, dir, wa, wb, ba, bb, d, pa: c.cellWin.p, pb: nb.cellWin.p, changedA, changedB, s: d / 32 });
+      // The two ways to close it: cell A takes B's level, or B takes A's. A cell's level is for the whole cell, so each says how much
+      // of that cell's ground goes under water that was dry (or comes out of the water). The choice that brings back a level the
+      // cell already had in an earlier plugin (a water mod's level that a later mod overwrote) comes first.
+      const plan = (cell, from, to) => {
+        let flood = 0, dry = 0, n = 0; const d2 = cell.winner ? (() => { try { return decodeLand(ctx, cell.winner); } catch (e) { return null; } })() : null;
+        if (d2 && d2.heights) for (const h of d2.heights) { n++; if (h < to && h >= from) flood++; else if (h >= to && h < from) dry++; }
+        const had = (cell.cellVers || []).slice(0, -1).reverse().find(v => v.hasWater && Math.abs(waterLevel(W, cell, v) - to) < 1);
+        return { x: cell.x, y: cell.y, level: to, from, flood: n ? flood / n : 0, dry: n ? dry / n : 0, had: had ? had.p : -1 };
+      };
+      const opts2 = [plan(c, wa, wb), plan(nb, wb, wa)];
+      const pick = opts2[0].had >= 0 && opts2[1].had < 0 ? 0 : opts2[1].had >= 0 && opts2[0].had < 0 ? 1 : (opts2[0].flood + opts2[0].dry <= opts2[1].flood + opts2[1].dry ? 0 : 1);
+      out.push({ a: c, b: nb, dir, wa, wb, ba, bb, d, pa: c.cellWin.p, pb: nb.cellWin.p, changedA, changedB, s: d / 32, fix: opts2, pick });
     }
   }
   out.sort((x, y) => y.d - x.d);
@@ -1558,6 +1779,7 @@ function findFloating(ctx, W, opts) {
   };
   for (const [key, r] of ctx.refs) {
     if (r.w !== W.key) continue;
+    { const bi0 = ctx.baseInfo.get(r.base); if (bi0 && bi0.fx) continue; }   // effects (smoke, mist) hang in the air on purpose
     const cx = Math.floor(r.x / 4096), cy = Math.floor(r.y / 4096);
     const c = W.cells.get(W.coordKey(cx, cy));
     if (!c || !c.winner || !c.winner.hasHeights) continue;
@@ -1601,13 +1823,23 @@ function decodeFull(ctx, v) {
   const d = decodeLand(ctx, v);
   let texK = null, texW = null;
   if (d.heights) {
-    texK = new Int32Array(NP * 3).fill(-1); texW = new Float32Array(NP * 3);
+    // up to 8 textures per point, as many as a quarter of a cell can blend: dropping the weak ones would let the others fill in
+    texK = new Int32Array(NP * 8).fill(-1); texW = new Float32Array(NP * 8);
     for (let r = 0; r < 33; r++) for (let c = 0; c < 33; c++) {
-      const k = r * 33 + c, w = texWeightsAt(ctx, d, r, c);
-      for (let j = 0; j < w.length; j++) { texK[k * 3 + j] = w[j][0]; texW[k * 3 + j] = w[j][1]; }
+      const k = r * 33 + c, w = texWeightsAt(ctx, d, r, c, 8);
+      for (let j = 0; j < w.length; j++) { texK[k * 8 + j] = w[j][0]; texW[k * 8 + j] = w[j][1]; }
     }
   }
-  return { heights: d.heights, normals: d.normals, colors: d.colors, texK, texW, base: d.base, layers: d.layers };
+  // the same per quarter (4 x 17 x 17 points): the game draws each quarter from its own copy of the lines between quarters
+  let texKQ = null, texWQ = null;
+  if (d.heights) {
+    texKQ = new Int32Array(1156 * 8).fill(-1); texWQ = new Float32Array(1156 * 8);
+    for (let qd = 0; qd < 4; qd++) for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+      const vi = qd * 289 + lr * 17 + lc, r = (qd & 2 ? 16 : 0) + lr, c = (qd & 1 ? 16 : 0) + lc, w = texWeightsAt(ctx, d, r, c, 8, qd);
+      for (let j = 0; j < w.length; j++) { texKQ[vi * 8 + j] = w[j][0]; texWQ[vi * 8 + j] = w[j][1]; }
+    }
+  }
+  return { heights: d.heights, normals: d.normals, colors: d.colors, texK, texW, texN: 8, texKQ, texWQ, base: d.base, layers: d.layers, layersAll: d.layersAll };
 }
 /** Corner points of a navmesh (world x, y, z), or null when the record can't be read. */
 function navVerts(e) {
@@ -1724,17 +1956,27 @@ function patchWriter(ctx, seed) {
   const CELL_F = ONE(['LTMP', 'XLCN', 'XCIM', 'XCWT', 'XOWN', 'XILL', 'XCCM', 'XCAS', 'XEZN', 'XCMO']), WRLD_F = ONE(['LTMP', 'XEZN', 'XLCN', 'WNAM', 'CNAM', 'NAM2', 'NAM3', 'ZNAM']);
   const XCLR = T('XCLR'), RNAM = T('RNAM');
   // a record copied from its winning plugin: same content, form IDs rewritten for this patch's master list
-  const copyRec = (raw, single) => {
+  // water: a level to give a CELL (its "Has Water" flag set, its XCLW written or replaced)
+  const copyRec = (raw, single, water = null) => {
     if (!raw || !raw.data) throw new Error("copyRec got " + JSON.stringify(raw && Object.keys(raw)));
     const P = ctx.plugins[raw.p], u8 = raw.data, dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     const type = dv.getUint32(0, true), size = dv.getUint32(4, true), flags = dv.getUint32(8, true), b = recordBody(u8, dv, 0, size, flags), parts = [];
+    const XCLW = T('XCLW'), DATA = T('DATA'), AFTER = new Set(['XNAM', 'XCLR', 'XLCN', 'XWCN', 'XWCS', 'XWCU', 'XCWT', 'XOWN', 'XILL', 'XWEM', 'XCCM', 'XCAS', 'XEZN', 'XCMO', 'XCIM'].map(T));
+    let wDone = water == null;
+    const wSub = () => { const d = new Uint8Array(4); new DataView(d.buffer).setFloat32(0, water, true); wDone = true; return sub(XCLW, d); };
     forEachSub(b.u8, b.dv, b.s, b.e, (t, o, l) => {
       const d = b.u8.slice(o, o + l), dd = new DataView(d.buffer);
+      if (water != null) {
+        if (t === XCLW) { parts.push(wSub()); return; }
+        if (t === DATA && l >= 1) d[0] |= 2;                     // Has Water
+        if (!wDone && AFTER.has(t)) parts.push(wSub());          // XCLW goes before these, as the game writes it
+      }
       if (single.has(t) && l >= 4) dd.setUint32(0, remap(P, dd.getUint32(0, true)), true);
       else if (t === XCLR) for (let k = 0; k + 4 <= l; k += 4) dd.setUint32(k, remap(P, dd.getUint32(k, true)), true);
       else if (t === RNAM) for (let k = 8; k + 8 <= l; k += 8) dd.setUint32(k, remap(P, dd.getUint32(k, true)), true);
       parts.push(sub(t, d));
     });
+    if (!wDone) parts.push(wSub());
     return rec(type, flags & ~COMP, remap(P, dv.getUint32(12, true)), u8.subarray(16, 24), cat(parts));
   };
   const tes4 = text => {
@@ -1974,7 +2216,7 @@ function zipStore(files) {
    each seam so their shared border meets. Nothing else is touched: textures, colours, objects, the
    load order. The border is set to the middle of the two sides and blended a few steps into each cell.
    ------------------------------------------------------------------------------------------------ */
-function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
+function buildSeamPatch(ctx, W, seams, edits, blends, strokes, fills, overflows, waterFixes) {
   const cellAt = (x, y) => { const c = W.cells.get(W.coordKey(x, y)); return c && c.winner && !c.ghost ? c : null; };
   const H0 = new Map();   // cell -> original heights (or null)
   const h0 = c => { if (!H0.has(c)) H0.set(c, decodeLand(ctx, c.winner).heights || null); return H0.get(c); };
@@ -2018,9 +2260,11 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     failed.push(...drop); todo = todo.filter(sm => !drop.includes(sm)); NEW = null;
     if (!todo.length) break;
   }
-  const hasEdits = edits && edits.size > 0, hasBlends = !!((blends && blends.length) || (strokes && strokes.length));
+  const hasEdits = edits && edits.size > 0, hasBlends = !!((blends && blends.length) || (strokes && strokes.length) || (fills && fills.length) || (overflows && overflows.length) || (waterFixes && waterFixes.length));
   if (!NEW) NEW = new Map();
-  if (!NEW.size && !hasEdits && !hasBlends) return { bytes: null, fixed: 0, failed, cells: 0, left: [] };
+  // with nothing new to do, an earlier patch of ours is still written again (in order) when it is in the load order
+  const hasOwn = [...W.cells.values()].some(c => (c.winner && ctx.plugins[c.winner.p].ownGround) || (c.cellWin && ctx.plugins[c.cellWin.p].ownGround));
+  if (!NEW.size && !hasEdits && !hasBlends && !hasOwn) return { bytes: null, fixed: 0, failed, cells: 0, left: [] };
   // ground edits made by hand (terraforming): a height change per lattice point, given to every cell that shares the point,
   // so borders keep meeting. Applied on top of the seam corrections.
   let editCells = 0, editBad = 0;
@@ -2037,7 +2281,7 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
       NEW.set(c, { h: nh, off: off + qv[0], q: qv }); editCells++;
     }
   }
-  if (!NEW.size && !hasBlends) return { bytes: null, fixed: 0, failed, cells: 0, left: [], error: 'the ground edits are too steep to store' };
+  if (!NEW.size && !hasBlends && (hasEdits || !hasOwn)) return { bytes: null, fixed: 0, failed, cells: 0, left: [], error: 'the ground edits are too steep to store' };
   const hNow = c => (NEW.get(c) || {}).h || h0(c);
   // check: every targeted border now meets, and no other border of a patched cell got worse
   const left = [];
@@ -2060,7 +2304,8 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     for (let r = 0; r < 33; r++) for (let q = 0; q < 33; q++) {
       const top = r > 16, right = q > 16, qd = (top ? 2 : 0) + (right ? 1 : 0), pos = (top ? r - 16 : r) * 17 + (right ? q - 16 : q);
       const w = new Map([[d.base[qd] < 0 ? -1 : d.base[qd], 1]]);
-      for (const L of d.layers[qd]) { const op = L.op[pos]; if (!(op > 0)) continue; const o = Math.min(1, op), lt = L.tex < 0 ? -1 : L.tex; for (const [t, val] of w) w.set(t, val * (1 - o)); w.set(lt, (w.get(lt) || 0) + o); }
+      // every layer the plugin holds: a quarter laid out again keeps the 6 that matter most instead of the game leaving some out
+      for (const L of (d.layersAll || d.layers)[qd]) { const op = L.op[pos]; if (!(op > 0)) continue; const o = Math.min(1, op), lt = L.tex < 0 ? -1 : L.tex; for (const [t, val] of w) w.set(t, val * (1 - o)); w.set(lt, (w.get(lt) || 0) + o); }
       for (const [t, val] of w) if (val > 0) arr(t)[r * 33 + q] = val;
     }
     TW.set(c, m); return m;
@@ -2078,6 +2323,43 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
       let dm = TD.get(c); if (!dm) TD.set(c, dm = new Map());
       for (const [t, v] of mean) { let a = dm.get(t); if (!a) dm.set(t, a = new Float32Array(1089)); a[k] = v - (own.has(t) ? own.get(t)[k] : 0); }
     }
+  }
+  /* ---- shading colours (VCLR) and lighting normals (VNML) on the shared border points: both cells get the average,
+     and the colour change fades back into each cell (like heights), so no straight line is left at the border ---- */
+  const CDl = new Map(), NNEW = new Map();
+  const colOf = c => { const d = decodeLand(ctx, c.winner); return d && d.colors; }, nrmOf = c => { const d = decodeLand(ctx, c.winner); return d && d.normals; };
+  for (const sm of todo) for (let i = 0; i <= 32; i++) {
+    const gx = sm.dir === 'E' ? sm.a.x * 32 + 32 : sm.a.x * 32 + i, gy = sm.dir === 'E' ? sm.a.y * 32 + i : sm.a.y * 32 + 32;
+    const sh = sharing(gx, gy); if (sh.length < 2) continue;
+    const cols = sh.map(([c, k]) => { const a = colOf(c); return a ? [a[k * 3], a[k * 3 + 1], a[k * 3 + 2]] : [255, 255, 255]; });
+    const mean = [0, 1, 2].map(ch => cols.reduce((t, v) => t + v[ch], 0) / cols.length);
+    sh.forEach(([c, k], n) => {
+      if (Math.max(...[0, 1, 2].map(ch => Math.abs(mean[ch] - cols[n][ch]))) <= 2) return;
+      let d = CDl.get(c); if (!d) CDl.set(c, d = new Float32Array(1089 * 3));
+      for (let ch = 0; ch < 3; ch++) d[k * 3 + ch] = mean[ch] - cols[n][ch];
+    });
+    const hs = sh.map(([c, k]) => h0(c)[k]);
+    if (Math.max(...hs) - Math.min(...hs) < 0.5) {      // same height: the lighting must match too
+      const ns = sh.map(([c, k]) => { const a = nrmOf(c); return a ? [a[k * 3], a[k * 3 + 1], a[k * 3 + 2]] : null; });
+      if (ns.every(Boolean)) {
+        const v = [0, 1, 2].map(ch => ns.reduce((t, x) => t + x[ch], 0)), len = Math.hypot(...v) || 1, avg = v.map(x => Math.round(x / len * 127));
+        sh.forEach(([c, k], n) => {
+          if (NEW.has(c) || Math.max(...[0, 1, 2].map(ch => Math.abs(avg[ch] - ns[n][ch]))) <= 2) return;
+          let a = NNEW.get(c); if (!a) NNEW.set(c, a = new Int8Array(nrmOf(c)));
+          for (let ch = 0; ch < 3; ch++) a[k * 3 + ch] = avg[ch];
+        });
+      }
+    }
+  }
+  const CNEW = new Map();
+  for (const [c, d] of CDl) {
+    const base = colOf(c), out = new Uint8Array(1089 * 3);
+    for (let ch = 0; ch < 3; ch++) {
+      const dl = new Float32Array(1089); for (let k = 0; k < 1089; k++) dl[k] = d[k * 3 + ch];
+      for (let it = 0; it < 90; it++) for (let r = 1; r < 32; r++) for (let q = 1; q < 32; q++) { const k = r * 33 + q; dl[k] = 0.9 * 0.25 * (dl[k - 1] + dl[k + 1] + dl[k - 33] + dl[k + 33]); }
+      for (let k = 0; k < 1089; k++) out[k * 3 + ch] = Math.max(0, Math.min(255, Math.round((base ? base[k * 3 + ch] : 255) + dl[k])));
+    }
+    CNEW.set(c, out);
   }
   /* ---- edges picked by hand in 3D: the ground textures cross-fade over a band on both sides of the border.
      At the band's outer rows nothing changes; on the border both cells get the half-and-half mix; in between it fades.
@@ -2108,19 +2390,39 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
   }
   /* ---- texture brush: remove a texture (what lies under it takes its place) or paint one, with a soft round brush.
      Worked out on the shared grid of points, so a point on a border changes the same way in every cell that holds it. ---- */
-  let painted = 0;
+  let painted = 0, filled = 0;
+  const TP = new Map(), mixOf = (gx, gy) => { const k = gx + ',' + gy; if (!TP.has(k)) TP.set(k, wAt(gx, gy)); return TP.get(k); };
+  /* ---- texture holes: where the standard ground shows, put back the mix of the last version that had real textures there,
+     with a soft edge (points next to the hole that carry a little standard ground get the same treatment) ---- */
+  for (const f of fills || []) {
+    const c = cellAt(f.x, f.y); if (!c || !c.lands) continue;
+    const src = [...c.lands].reverse().find(v => v.p === f.from); if (!src) continue;
+    let dw, ds; try { dw = decodeLand(ctx, c.winner); ds = decodeLand(ctx, src); } catch (e) { continue; }
+    let any = false;
+    for (let k = 0; k < 1089; k++) {
+      const now = mixOfDecoded(dw, k), dflt = now.get(-1) || 0; if (dflt < 0.05) continue;
+      const was = mixOfDecoded(ds, k); if ((was.get(-1) || 0) >= dflt) continue;      // it was already standard ground there
+      const r = Math.floor(k / 33), q = k % 33, m = mixOf(c.x * 32 + q, c.y * 32 + r); if (!m) continue;
+      for (const t of [...m.keys()]) m.set(t, 0);
+      for (const [t, v] of was) m.set(t, v);
+      any = true;
+    }
+    if (any) filled++;
+  }
   if (strokes && strokes.length) {
-    const TP = new Map(), mixOf = (gx, gy) => { const k = gx + ',' + gy; if (!TP.has(k)) TP.set(k, wAt(gx, gy)); return TP.get(k); };
     for (const st of strokes) {
       const R = st.r / 128, cx = st.x / 128, cy = st.y / 128; let any = false;
       for (let gy = Math.ceil(cy - R); gy <= Math.floor(cy + R); gy++) for (let gx = Math.ceil(cx - R); gx <= Math.floor(cx + R); gx++) {
         const dd = Math.hypot(gx - cx, gy - cy) / R; if (dd > 1) continue;
         const f = Math.min(1, st.amt) * (1 - dd * dd), m = mixOf(gx, gy); if (!m) continue;
         const cur = m.get(st.tex) || 0;
+        // the game's standard ground (no texture record, -1) is never what takes over: only real textures replace a removed one
         if (st.mode === 'erase') {
-          const rest = 1 - cur; if (cur <= 0 || rest < 0.02) continue;          // nothing else there to take its place
-          const nw = cur * (1 - f), k = (1 - nw) / rest;
-          for (const [t, v] of m) m.set(t, t === st.tex ? nw : v * k);
+          let rest = 0; for (const [t, v] of m) if (t !== st.tex && t !== -1) rest += v;
+          if (cur <= 0 || rest < 0.02) continue;          // nothing real there to take its place
+          const nw = cur * (1 - f), freed = cur - nw;
+          for (const [t, v] of m) if (t !== st.tex && t !== -1) m.set(t, v + freed * v / rest);
+          m.set(st.tex, nw);
         } else {
           const nw = cur + f * (1 - cur), k = cur < 1 ? (1 - nw) / (1 - cur) : 0;
           for (const [t, v] of m) if (t !== st.tex) m.set(t, v * k);
@@ -2130,6 +2432,8 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
       }
       if (any) painted++;
     }
+  }
+  {
     for (const [k, m] of TP) {
       if (!m) continue;
       const [gx, gy] = k.split(',').map(Number);
@@ -2154,26 +2458,136 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     for (const t of new Set([...own.keys(), ...dm.keys(), ...(bd ? bd.keys() : [])])) { const a = new Float32Array(1089), o = own.get(t), dl = dm.get(t), b2 = bd && bd.get(t); for (let k = 0; k < 1089; k++) a[k] = Math.max(0, (o ? o[k] : 0) + (dl ? dl[k] : 0) + (b2 ? b2[k] : 0)); w.set(t, a); }
     if (quads.size) TNEW.set(c, { w, quads });
   }
+  // quarter edges an earlier patch of ours overwrote: always laid out again, with each quarter's own copy back
+  const EDGE = ownEdgeLost(ctx, W); let reedged = 0;
+  for (const [c, m] of EDGE) {
+    let TN = TNEW.get(c); if (!TN) { const w = new Map(); for (const [t, a] of tw(c)) w.set(t, Float32Array.from(a)); TNEW.set(c, TN = { w, quads: new Set() }); }
+    for (const [q, pts] of m) { TN.quads.add(q); reedged += pts.size; }
+  }
+  // quarters an earlier patch of ours rebuilt in another layout: always laid out again in the original's layout
+  let relaid = 0;
+  for (const o of ownRebuilt(ctx, W)) {
+    const c = cellAt(o.x, o.y); if (!c) continue;
+    let TN = TNEW.get(c); if (!TN) { const w = new Map(); for (const [t, a] of tw(c)) w.set(t, Float32Array.from(a)); TNEW.set(c, TN = { w, quads: new Set() }); }
+    for (const q of o.quads) { TN.quads.add(q); relaid++; }
+  }
+  // quarters an earlier patch of ours left without their base texture: always laid out again, with the base texture back
+  let rebased = 0;
+  for (const o of ownBaseLost(ctx, W)) {
+    const c = cellAt(o.x, o.y); if (!c) continue;
+    let TN = TNEW.get(c); if (!TN) { const w = new Map(); for (const [t, a] of tw(c)) w.set(t, Float32Array.from(a)); TNEW.set(c, TN = { w, quads: new Set() }); }
+    for (const q of o.quads) { TN.quads.add(q); rebased++; }
+  }
+  // quarters with too many textures: laid out again with the 6 that cover the most ground
+  const OVQ = new Map(); let overflowed = 0;
+  for (const o of overflows || []) {
+    const c = cellAt(o.x, o.y); if (!c || !c.winner) continue;
+    let TN = TNEW.get(c); if (!TN) { const w = new Map(); for (const [t, a] of tw(c)) w.set(t, Float32Array.from(a)); TNEW.set(c, TN = { w, quads: new Set() }); }
+    const m = new Map(); for (const [q, bad] of Object.entries(o.quads)) { TN.quads.add(Number(q)); m.set(Number(q), bad); }
+    OVQ.set(c, m); overflowed++;
+  }
   // one quarter of a cell laid out again from its texture weights (at most 6 textures, as the game allows)
-  const quadPlan = (w, qd) => {
+  const quadPlan = (w0, qd, allow = 2, ob = null, c = null) => {
     const r0 = qd & 2 ? 16 : 0, q0 = qd & 1 ? 16 : 0, at = (lr, lc) => (r0 + lr) * 33 + q0 + lc, stat = [];
+    // The line between two quarters is stored in both, and the game draws each quarter from its own copy. The cell's weights
+    // (w0) hold the lower/left quarter's copy there, so for the upper/right quarters that line starts again from the quarter's
+    // own copy, plus whatever change this patch makes at those points.
+    let w = w0;
+    if (c && (qd & 3)) {
+      let d = null; try { d = decodeLand(ctx, c.winner); } catch (e) { d = null; }
+      if (d) {
+        const base = tw(c); w = new Map(); for (const [t, a] of w0) w.set(t, a);
+        const fixQ = EDGE.get(c) && EDGE.get(c).get(qd), own = (lr, lc) => (fixQ && fixQ.get(lr * 17 + lc)) || quarterMix(d, qd, lr, lc);
+        const copied = new Set(), cp = t => { if (!copied.has(t)) { copied.add(t); w.set(t, w.has(t) ? Float32Array.from(w.get(t)) : new Float32Array(1089)); } return w.get(t); };
+        for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+          if (!((qd & 2 && lr === 0) || (qd & 1 && lc === 0))) continue;
+          const k = at(lr, lc), m = own(lr, lc), ts = new Set([...m.keys(), ...w0.keys()]);
+          for (const t of ts) { const now = w0.has(t) ? w0.get(t)[k] : 0, was = base.has(t) ? base.get(t)[k] : 0, v = Math.max(0, (m.get(t) || 0) + now - was); if (v !== now) cp(t)[k] = v; }
+        }
+      }
+    }
+    // read a plan back the way the layers blend, and compare with the wanted mix at every point
+    const checkPlan = plan => {
+      const opAt = plan.layers.map(L => { const a = new Float32Array(289); for (const [pos, o] of L.ops) a[pos] = o; return a; });
+      let bad = 0, worst = 0;
+      for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+        const k = at(lr, lc), pos = lr * 17 + lc, got = new Map([[plan.base, 1]]);
+        plan.layers.forEach((L, i) => { const o = opAt[i][pos]; if (!(o > 0)) return; for (const [t, v] of got) got.set(t, v * (1 - o)); got.set(L.t, (got.get(L.t) || 0) + o); });
+        let tot = 0; for (const a of w.values()) tot += a[k]; if (!(tot > 0)) continue;
+        let diff = 0; for (const t of new Set([...w.keys(), ...got.keys()])) diff += Math.abs((w.has(t) ? w.get(t)[k] / tot : 0) - (got.get(t) || 0));
+        diff /= 2; if (diff > worst) worst = diff; if (diff > 0.15) bad++;
+      }
+      plan.worst = worst; plan.ok = bad <= allow; plan.bad = bad; return plan;
+    };
+    /* First choice: keep the quarter exactly as its plugin built it (same base texture, same layers in the same order) and only
+       change the opacities at the points this patch changes; every other point keeps its original opacities, hidden layers
+       included. The game does not blend a re-built quarter exactly like the original even when the layers say the same ground,
+       so nothing that was not meant to change is rebuilt. New textures go on top; past 6 textures it falls back to a new layout. */
+    if (c) {
+      const src = [...(c.lands || [c.winner])].reverse().find(v => !ctx.plugins[v.p].ownGround) || c.winner;
+      let sd = null; try { sd = decodeLand(ctx, src); } catch (e) { sd = null; }
+      if (sd && sd.heights) {
+        const fixQ = EDGE.get(c) && EDGE.get(c).get(qd);
+        const orig = (sd.layersAll || sd.layers)[qd].slice().sort((a, b) => a.layer - b.layer), lay = orig.map(L => ({ t: L.tex < 0 ? -1 : L.tex, src: L }));
+        const bt = sd.base[qd] < 0 ? -1 : sd.base[qd], have = new Set([bt, ...lay.map(L => L.t)]);
+        const added = [];
+        for (const [t, a] of w) { if (have.has(t)) continue; let mx = 0, sum = 0; for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) { const v = a[at(lr, lc)]; sum += v; mx = Math.max(mx, v); } if (mx >= 0.02) { added.push({ t, src: null, sum }); have.add(t); } }
+        // past 6 textures, the weakest new ones stay out (the quarter's own textures always stay)
+        added.sort((a, b) => b.sum - a.sum);
+        while (added.length && new Set([bt, ...lay.map(L => L.t), ...added.map(L => L.t)]).size > GAME_TEX_PER_QUAD) added.pop();
+        lay.push(...added);
+        const distinct = new Set([bt, ...lay.map(L => L.t)]);
+        if (distinct.size <= GAME_TEX_PER_QUAD) {
+          const ops = lay.map(() => []), top = new Map(); lay.forEach((L, i) => top.set(L.t, i));   // a texture's weight goes to its topmost layer
+          for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
+            const k = at(lr, lc), pos = lr * 17 + lc; let tot = 0; for (const t of distinct) tot += w.has(t) ? w.get(t)[k] : 0;
+            const want = new Map(); if (tot > 0) for (const t of distinct) { const v = w.has(t) ? w.get(t)[k] / tot : 0; if (v > 0) want.set(t, v); }
+            const was = (fixQ && fixQ.get(pos)) || quarterMix(sd, qd, lr, lc);
+            if (!(tot > 0) || (mixDiff(want, was) < 0.01 && !(fixQ && fixQ.has(pos)))) { lay.forEach((L, i) => { const o = L.src ? L.src.op[pos] : 0; if (o > 0) ops[i].push([pos, o]); }); continue; }
+            let above = 0;
+            for (let i = lay.length - 1; i >= 0; i--) { if (top.get(lay[i].t) !== i) continue; const wi = want.get(lay[i].t) || 0, o = 1 - above > 1e-6 ? wi / (1 - above) : 0; above += wi; if (o > 0.003) ops[i].push([pos, Math.min(1, o)]); }
+          }
+          const fp = checkPlan({ base: bt, layers: lay.map((L, i) => ({ t: L.t, ops: ops[i] })).filter(L => L.ops.length), kept: true });
+          if (fp.ok) return fp;
+          if (globalThis.__whyFallback) globalThis.__whyFallback.push(['check', c.x, c.y, qd, fp.bad, fp.worst.toFixed(2)]);
+        }
+      }
+    }
     for (const [t, a] of w) { let mx = 0, sum = 0; for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) { const v = a[at(lr, lc)]; sum += v; if (v > mx) mx = v; } if (mx >= 0.02) stat.push({ t, sum }); }
     stat.sort((a, b) => b.sum - a.sum);
+    // the game's default ground (no texture record) can only be the bottom texture; where it is only a trace, drop it
+    // rather than turn the whole quarter's base into it
+    const dflt = stat.find(x => x.t < 0);
+    if (dflt && stat.length > 1) { let mxd = 0; const a = w.get(-1); for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) mxd = Math.max(mxd, a[at(lr, lc)]); if (mxd < 0.25) stat.splice(stat.indexOf(dflt), 1); }
     const keep = stat.slice(0, 6); if (!keep.length) return null;
-    const base = keep.find(x => x.t < 0) || keep[0], layers = keep.filter(x => x !== base), ops = layers.map(() => []);
+    // The base texture: the quarter's own one when it is still there. A quarter that had a real base texture never loses it to
+    // the game's standard ground (the game does not draw that as the layers say: it shows a hard-edged patch of dirt02); the
+    // standard ground then goes in as a layer (texture 0), as the game's own data does. Only a quarter that had no base keeps none.
+    const real = keep.filter(x => x.t >= 0);
+    const base = (ob != null && ob >= 0 && keep.find(x => x.t === ob)) || (ob != null && ob < 0 && keep.find(x => x.t < 0)) || real[0] || keep[0];
+    const layers = keep.filter(x => x !== base), ops = layers.map(() => []);
     for (let lr = 0; lr < 17; lr++) for (let lc = 0; lc < 17; lc++) {
       const k = at(lr, lc); let tot = 0; for (const x of keep) tot += w.get(x.t)[k]; if (!(tot > 0)) continue;
       let above = 0;
       for (let i = layers.length - 1; i >= 0; i--) { const wi = w.get(layers[i].t)[k] / tot, o = 1 - above > 1e-6 ? wi / (1 - above) : 0; above += wi; if (o > 0.003) ops[i].push([lr * 17 + lc, Math.min(1, o)]); }
     }
-    return { base: base.t, layers: layers.map((L, i) => ({ t: L.t, ops: ops[i] })).filter(L => L.ops.length) };
+    return checkPlan({ base: base.t, layers: layers.map((L, i) => ({ t: L.t, ops: ops[i] })).filter(L => L.ops.length) });
   };
+  // a quarter whose new texture layers do not read back as wanted keeps its original textures: never write a worse one
+  let texHeld = 0;
+  // (a quarter with too many textures only has to come out better than what the game draws there now)
+  const obOf = (c, qd) => {   // the quarter's base texture in the last version that is not an earlier patch of ours
+    const src = [...(c.lands || [c.winner])].reverse().find(v => !ctx.plugins[v.p].ownGround) || c.winner;
+    try { return decodeLand(ctx, src).base[qd]; } catch (e) { return null; }
+  };
+  const allowOf = (c, qd) => { const m = OVQ.get(c); return m && m.has(qd) ? Math.max(2, m.get(qd) - 1) : 2; };
+  for (const [c, TN] of [...TNEW]) { for (const qd of [...TN.quads]) { const pl = quadPlan(TN.w, qd, allowOf(c, qd), obOf(c, qd), c); if (!pl || !pl.ok) { TN.quads.delete(qd); texHeld++; } } if (!TN.quads.size) TNEW.delete(c); }
   // the patched cells as "what if" versions, so the 3D view can show the result before any file exists
   const preview = new Map();
   for (const c of new Set([...NEW.keys(), ...TNEW.keys()])) {
     const d = decodeLand(ctx, c.winner), N = NEW.get(c), TN = TNEW.get(c);
     const dec = { heights: N ? N.h : d.heights, normals: d.normals, colors: d.colors, base: d.base.slice(), layers: d.layers.slice(), flags: d.flags };
-    if (TN) for (const qd of TN.quads) { const pl = quadPlan(TN.w, qd); if (!pl) continue; dec.base[qd] = pl.base; dec.layers[qd] = pl.layers.map((L, n) => { const op = new Float32Array(289); for (const [pos, o] of L.ops) op[pos] = o; return { tex: L.t, layer: n, op }; }); }
+    if (TN) for (const qd of TN.quads) { const pl = quadPlan(TN.w, qd, 2, obOf(c, qd), c); if (!pl) continue; dec.base[qd] = pl.base; dec.layers[qd] = pl.layers.map((L, n) => { const op = new Float32Array(289); for (const [pos, o] of L.ops) op[pos] = o; return { tex: L.t, layer: n, op }; }); }
     const v = Object.assign({}, c.winner, { _decoded: dec, preview: true }); delete v.real; delete v._body;
     v.edges = extractEdges(ctx, dec);
     preview.set(c, v);
@@ -2188,8 +2602,17 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
   // new plugin replaces it and everything stays in ONE plugin (the old one is then switched off).
   const carried = [];
   for (const c of W.cells.values()) if (c.winner && ctx.plugins[c.winner.p].ownGround && !NEW.has(c) && !TNEW.has(c) && ctx.cellRaw.get(c.cellKey)) carried.push(c);
-  const cells = [...new Set([...NEW.keys(), ...TNEW.keys(), ...carried])].filter(c => ctx.cellRaw.get(c.cellKey));
+  const cells = [...new Set([...NEW.keys(), ...TNEW.keys(), ...CNEW.keys(), ...NNEW.keys(), ...carried])].filter(c => ctx.cellRaw.get(c.cellKey));
   for (const c of cells) { need(ctx.plugins[ctx.cellRaw.get(c.cellKey).p]); need(ctx.plugins[c.winner.p]); }
+  // water levels: the cell record gets the chosen level. A cell with only a water fix is written without ground (no LAND).
+  // A water level set by an earlier patch of ours is carried the same way (its cell record is the one copied).
+  const WFIX = new Map();
+  for (const f of waterFixes || []) { const c = W.cells.get(W.coordKey(f.x, f.y)); if (c && !c.ghost && ctx.cellRaw.get(c.cellKey) && isFinite(f.level)) WFIX.set(c, f.level); }   // a cell without ground can have water too
+  const inCells = new Set(cells), waterOnly = [];
+  for (const c of WFIX.keys()) if (!inCells.has(c)) waterOnly.push(c);
+  for (const c of W.cells.values()) if (c.cellWin && ctx.plugins[c.cellWin.p].ownGround && !inCells.has(c) && !WFIX.has(c) && ctx.cellRaw.get(c.cellKey)) waterOnly.push(c);
+  for (const c of waterOnly) need(ctx.plugins[ctx.cellRaw.get(c.cellKey).p]);
+  const watered = WFIX.size;
   const real = new Map(ctx.plugins.map(P => [P.lname, P]));
   const masters = [...used].sort((a, b) => (real.has(a) ? real.get(a).idx : -1) - (real.has(b) ? real.get(b).idx : -1)).map(l => real.has(l) ? real.get(l).name : l);
   const write = seed => {
@@ -2201,11 +2624,11 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     return hNow(n)[(r < 0 ? 31 : r > 32 ? 1 : r) * 33 + (q < 0 ? 31 : q > 32 ? 1 : q)];
   };
   const VTXT = TY.VTXT;
-  const quadSubs = (w, qd) => {
-    const pl = quadPlan(w, qd), out = []; if (!pl) return out;
+  const quadSubs = (w, qd, c) => {
+    const pl = quadPlan(w, qd, 2, obOf(c, qd), c), out = []; if (!pl) return out;
     if (pl.base >= 0) { const b = new Uint8Array(8); new DataView(b.buffer).setUint32(0, keyId(pl.base), true); b[4] = qd; b[6] = 0xff; b[7] = 0xff; out.push(sub(BTXT, b)); }
     pl.layers.forEach((L, n) => {
-      const a = new Uint8Array(8), av = new DataView(a.buffer); av.setUint32(0, keyId(L.t), true); a[4] = qd; av.setUint16(6, n, true);
+      const a = new Uint8Array(8), av = new DataView(a.buffer); av.setUint32(0, L.t < 0 ? 0 : keyId(L.t), true); a[4] = qd; av.setUint16(6, n, true);
       out.push(sub(ATXT, a));
       const vt = new Uint8Array(L.ops.length * 8), vv = new DataView(vt.buffer); L.ops.forEach(([pos, o], k) => { vv.setUint16(k * 8, pos, true); vv.setFloat32(k * 8 + 4, o, true); });
       out.push(sub(VTXT, vt));
@@ -2213,14 +2636,27 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
     return out;
   };
   const landRec = c => {
-    const v = c.winner, P = ctx.plugins[v.p], body = landBody(v), dv = new DataView(body.buffer, body.byteOffset, body.byteLength), N = NEW.get(c), old = h0(c), parts = [], TN = TNEW.get(c);
-    let texDone = !TN, skipQ = -1;
-    const putTex = () => { if (texDone) return; texDone = true; for (const qd of [...TN.quads].sort()) parts.push(...quadSubs(TN.w, qd)); };
+    const v = c.winner, P = ctx.plugins[v.p], body = landBody(v), dv = new DataView(body.buffer, body.byteOffset, body.byteLength), N = NEW.get(c), old = h0(c), parts = [], TN = TNEW.get(c), CN = CNEW.get(c), NN = NNEW.get(c);
+    let colDone = !CN, texAt = -1, curL = null;
+    const putCol = () => { if (colDone) return; colDone = true; parts.push(sub(TY.VCLR, CN)); };   // a cell that had no colours gets them
+    // Texture data is always written in the standard order, quarter by quarter (0 to 3): its base texture, then its layers by
+    // layer number, each followed by its opacities. Rewritten quarters take their place in that order, never in front.
+    const G = [0, 1, 2, 3].map(() => ({ base: null, layers: [] }));
     forEachSub(body, dv, 0, body.length, (t, o, l) => {
       const d = body.slice(o, o + l), dd = new DataView(d.buffer);
-      if (TN && (t === BTXT || t === ATXT) && l >= 5) { putTex(); skipQ = TN.quads.has(d[4]) ? d[4] : -1; if (skipQ >= 0) return; }
-      else if (TN && t === VTXT) { if (skipQ >= 0) return; }
-      else skipQ = -1;
+      if (t === TY.VCLR && CN) { putCol(); return; }
+      if (t === BTXT || t === ATXT) putCol();
+      if (NN && t === VNML && l >= 3267) { parts.push(sub(t, new Uint8Array(NN.buffer.slice(0)))); return; }
+      if (t === BTXT || t === ATXT || t === VTXT) {
+        if (texAt < 0) { texAt = parts.length; parts.push(null); }
+        if (t === VTXT) { if (curL) curL.v = sub(t, d); return; }
+        if (l < 5) { curL = null; return; }
+        if (l >= 4 && dd.getUint32(0, true)) dd.setUint32(0, remap(P, dd.getUint32(0, true)), true);   // 0 (standard ground) stays 0
+        const q = d[4] & 3;
+        if (t === BTXT) { G[q].base = sub(t, d); curL = null; }
+        else { curL = { a: sub(t, d), v: null, n: l >= 8 ? dd.getUint16(6, true) : 0 }; G[q].layers.push(curL); }
+        return;
+      }
       if (N && t === VHGT && l >= 1093) {
         dd.setFloat32(0, N.off, true);
         for (let r = 0; r < 33; r++) for (let q = 0; q < 33; q++) dd.setInt8(4 + r * 33 + q, q ? N.q[r * 33 + q] - N.q[r * 33 + q - 1] : r ? N.q[r * 33] - N.q[r * 33 - 33] : 0);
@@ -2233,14 +2669,21 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
           const gx = ((e == null ? here : e) - (w == null ? here : w)) / ((e == null || w == null) ? 128 : 256), gy = ((n == null ? here : n) - (s2 == null ? here : s2)) / ((n == null || s2 == null) ? 128 : 256), len = Math.hypot(gx, gy, 1);
           dd.setInt8(k * 3, Math.round(-gx / len * 127)); dd.setInt8(k * 3 + 1, Math.round(-gy / len * 127)); dd.setInt8(k * 3 + 2, Math.round(127 / len));
         }
-      } else if ((t === BTXT || t === ATXT) && l >= 4) dd.setUint32(0, remap(P, dd.getUint32(0, true)), true);
+      }
       parts.push(sub(t, d));
     });
-    putTex();
+    putCol();
+    const tex = [];
+    for (let q = 0; q < 4; q++) {
+      if (TN && TN.quads.has(q)) { tex.push(...quadSubs(TN.w, q, c)); continue; }
+      if (G[q].base) tex.push(G[q].base);
+      for (const L of G[q].layers.slice().sort((a, b) => a.n - b.n)) { tex.push(L.a); if (L.v) tex.push(L.v); }
+    }
+    if (texAt >= 0) parts.splice(texAt, 1, ...tex); else parts.push(...tex);
     return rec(TY.LAND, 0, keyId(v.landKey), null, cat(parts));
   };
   const blocks = new Map();
-  for (const c of cells) {
+  for (const c of [...cells, ...waterOnly]) {
     const bk = `${Math.floor(c.y / 32)},${Math.floor(c.x / 32)}`, sk = `${Math.floor(c.y / 8)},${Math.floor(c.x / 8)}`;
     let bl = blocks.get(bk); if (!bl) blocks.set(bk, bl = new Map());
     let sb = bl.get(sk); if (!sb) bl.set(sk, sb = []);
@@ -2251,10 +2694,11 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
   const worldRec = copyRec(wraw, WRLD_F);
   const blockGroups = [...blocks].map(([bk, bl]) => grup(lab(bk), 4, [...bl].map(([sk, list]) => grup(lab(sk), 5, list.flatMap(c => {
     const cid = keyId(c.cellKey);
-    return [copyRec(ctx.cellRaw.get(c.cellKey), CELL_F), grup(cid, 6, [grup(cid, 9, [landRec(c)])])];
+    const crec = copyRec(ctx.cellRaw.get(c.cellKey), CELL_F, WFIX.has(c) ? WFIX.get(c) : null);
+    return inCells.has(c) ? [crec, grup(cid, 6, [grup(cid, 9, [landRec(c)])])] : [crec];
   })))));
   const top = grup(T('WRLD'), 0, [worldRec, grup(worldId, 1, blockGroups)]);
-  const head = tes4(`Ground patch: ${todo.length - left.length} cell border(s) aligned${editCells ? `, ${editCells} cell(s) reshaped by hand` : ''}${blendDone ? `, ground textures blended across ${blendDone} border(s)` : ''}${painted ? `, ${painted} texture brush stroke(s)` : ''}. Load after the plugins that change this ground. Make it again if your load order changes.`);
+  const head = tes4(`Ground patch: ${todo.length - left.length} cell border(s) aligned${watered ? `, ${watered} water level(s) matched` : ''}${editCells ? `, ${editCells} cell(s) reshaped by hand` : ''}${blendDone ? `, ground textures blended across ${blendDone} border(s)` : ''}${painted ? `, ${painted} texture brush stroke(s)` : ''}${filled ? `, lost textures put back in ${filled} cell(s)` : ''}${overflowed ? `, ${overflowed} cell(s) brought back to the 6 textures the game can draw` : ''}. Load after the plugins that change this ground. Make it again if your load order changes.`);
   return { bytes: cat([head, top]), masters: Wr.masters };
   };
   // first pass finds which plugins are really needed; the second writes them in load order
@@ -2262,12 +2706,13 @@ function buildSeamPatch(ctx, W, seams, edits, blends, strokes) {
   const fin = write(write([]).masters.slice().sort((a, b) => (loadIdx.has(a.toLowerCase()) ? loadIdx.get(a.toLowerCase()) : -1) - (loadIdx.has(b.toLowerCase()) ? loadIdx.get(b.toLowerCase()) : -1)));
   // what it must load after: the last plugin below it for these cells (an earlier patch of ours does not count: this one replaces it)
   const below = c => { if (!ctx.plugins[c.winner.p].ownGround) return c.winner.p; for (let i = c.lands.length - 1; i >= 0; i--) if (!ctx.plugins[c.lands[i].p].ownGround) return c.lands[i].p; return 0; };
-  const lastLand = Math.max(0, ...cells.map(below));
-  const replaces = [...new Set(cells.filter(c => ctx.plugins[c.winner.p].ownGround).map(c => ctx.plugins[c.winner.p].name))];
+  const belowCell = c => { const vs = c.cellVers || []; for (let i = vs.length - 1; i >= 0; i--) if (!ctx.plugins[vs[i].p].ownGround) return vs[i].p; return 0; };
+  const lastLand = Math.max(0, ...cells.map(below), ...waterOnly.map(belowCell), ...[...WFIX.keys()].map(belowCell));
+  const replaces = [...new Set([...cells.filter(c => ctx.plugins[c.winner.p].ownGround).map(c => ctx.plugins[c.winner.p].name), ...waterOnly.filter(c => c.cellWin && ctx.plugins[c.cellWin.p].ownGround).map(c => ctx.plugins[c.cellWin.p].name)])];
   // an earlier patch that also holds ground in another worldspace cannot be removed yet: only this worldspace was carried
   const elsewhere = new Set();
   for (const [ck, lands] of ctx.cellLands) { const last = lands[lands.length - 1], ci = ctx.cellInfo.get(ck); if (last && ci && ci.world !== W.world.key && ctx.plugins[last.p].ownGround) elsewhere.add(ctx.plugins[last.p].name); }
-  return { bytes: fin.bytes, fixed: todo.length - left.length, failed, left, cells: cells.length, worse, masters: fin.masters, preview, editCells, editBad, texCells: TNEW.size, blended: blendDone, painted, carried: carried.length, replaces, keep: replaces.filter(n => elsewhere.has(n)), after: ctx.plugins[lastLand].name };
+  return { bytes: fin.bytes, fixed: todo.length - left.length, failed, left, cells: cells.length, worse, masters: fin.masters, preview, editCells, editBad, texCells: TNEW.size, texHeld, filled, overflowed, rebased, reedged, relaid, watered, colCells: CNEW.size, blended: blendDone, painted, carried: carried.length, replaces, keep: replaces.filter(n => elsewhere.has(n)), after: ctx.plugins[lastLand].name };
 }
 /* ================================================================================================
    Navmesh health: deleted navmeshes, links between navmeshes that no longer hold, and their patch.
@@ -2680,7 +3125,7 @@ const api = {
   isCityWorld, buildSeamPatch, applyEdits, buildDisablePatch, zipStore, navIssues, navVerts, navGeometry,
   inflateZlib, parsePlugin, readHeader, resolveLoadOrder, newContext, decodeLand, extractEdges, compareEdges,
   score, scoreParts, mainIssue, visible, VIS, analyzeWorld, findSeams, findWaterSeams, findFloating, pluginSummary, terrainWorlds,
-  texMixAt, keyLabel, prettyWorld, DEFAULT_CHECKS, refEnabled, townLocation, gapReason, findIgnored, realColors, recolorWorld, pairMetricsDry, borderWater, maskUnderwater, texName, texCompareKey, heightAt, pairMetrics, waterLevel, OFFICIAL, decodeFull, texWeightsAt
+  texMixAt, surfaceSeams, textureHoles, textureOverflow, ownPatchOrder, ownBaseLost, ownEdgeLost, ownRebuilt, keyLabel, prettyWorld, DEFAULT_CHECKS, refEnabled, townLocation, gapReason, findIgnored, realColors, recolorWorld, pairMetricsDry, borderWater, maskUnderwater, texName, texCompareKey, heightAt, pairMetrics, waterLevel, OFFICIAL, decodeFull, texWeightsAt
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.TSI = api;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -2907,7 +3352,7 @@ class AssetStore {
       if (!this.meshWhy) this.meshWhy = new Map();
       const u8 = await this.get(key); if (!u8) { this.meshWhy.set(key, 'missing'); return null; }
       let m; try { m = parseNif(u8); } catch (e) { this.errors.push(`${key}: ${e.message}`); this.meshWhy.set(key, 'unreadable: ' + e.message); return null; }
-      if (!m.shapes.length) { this.meshWhy.set(key, 'empty'); return null; }
+      if (!m.shapes.length && !(m.particles && m.particles.length)) { this.meshWhy.set(key, 'empty'); return null; }   // particles alone (smoke, embers) still count
       // colours: a quick guess now, the real texture colour as soon as it has been read
       const avg = () => {
         let wr = 0, wg = 0, wb = 0, wt = 0;
@@ -3019,17 +3464,57 @@ function parseNif(u8) {
   };
   const toCol = av => ({ r: av.r.slice(), t: av.t, s: av.s });
 
+  /* Texture animation (flowing water, rising steam): the shader's float controllers that move its U / V offset. Speed is
+     the change of the offset per second from the controller's keys (times its frequency); 0 when there is none. */
+  const sizedStr = o => { const l = dv.getUint32(o, true); return { s: latin1.decode(u8.subarray(o + 4, o + 4 + l)).replace(/\0$/, ''), o: o + 4 + l }; };
+  const floatKeys = interp => {
+    if (interp < 0 || interp >= numBlocks || btype[interp] !== 'NiFloatInterpolator') return null;
+    const data = dv.getInt32(bstart[interp] + 4, true);
+    if (data < 0 || data >= numBlocks || btype[data] !== 'NiFloatData') return { keys: [], value: dv.getFloat32(bstart[interp], true) };
+    let o = bstart[data]; const n = dv.getUint32(o, true); o += 4; if (!n) return { keys: [], value: dv.getFloat32(bstart[interp], true) };
+    const it = dv.getUint32(o, true); o += 4; const step = it === 2 ? 16 : it === 3 ? 20 : 8, keys = [];
+    for (let k = 0; k < n && o + 8 <= bstart[data] + bsize[data]; k++, o += step) keys.push([dv.getFloat32(o, true), dv.getFloat32(o + 4, true)]);
+    return { keys, value: dv.getFloat32(bstart[interp], true) };
+  };
+  const uvAnim = (ctl, uVar, vVar) => {
+    const out = [0, 0]; let guard = 0;
+    while (ctl >= 0 && ctl < numBlocks && guard++ < 16) {
+      const o = bstart[ctl], ty = btype[ctl];
+      if (/ShaderPropertyFloatController$/.test(ty)) {
+        const freq = dv.getFloat32(o + 6, true) || 1, interp = dv.getInt32(o + 26, true), cv = dv.getUint32(o + 30, true), fk = floatKeys(interp);
+        if (fk && fk.keys.length >= 2 && (cv === uVar || cv === vVar)) { const [t0, v0] = fk.keys[0], [t1, v1] = fk.keys[fk.keys.length - 1]; if (t1 > t0) out[cv === uVar ? 0 : 1] = (v1 - v0) / (t1 - t0) * freq; }
+      }
+      ctl = dv.getInt32(o, true);   // next controller
+    }
+    return out;
+  };
+  // BSEffectShaderProperty: glowing / see-through surfaces (waterfalls, steam, mist, smoke, fire): its texture, colour, strength
+  const effShader = ref => {
+    if (ref < 0 || ref >= numBlocks || btype[ref] !== 'BSEffectShaderProperty') return null;
+    let o = bstart[ref]; o += 4; const nExtra = dv.getUint32(o, true); o += 4 + nExtra * 4; const ctl = dv.getInt32(o, true); o += 4;
+    const f1 = dv.getUint32(o, true), f2 = dv.getUint32(o + 4, true); o += 8;
+    const uvo = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true)], uvs = [dv.getFloat32(o + 8, true), dv.getFloat32(o + 12, true)]; o += 16;
+    const src = sizedStr(o); o = src.o + 4;              // texture, clamp, lighting influence, env map LOD, unused
+    o += 16;                                             // falloff angles and opacities
+    const emis = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true), dv.getFloat32(o + 8, true), dv.getFloat32(o + 12, true)], mult = dv.getFloat32(o + 16, true);
+    // the colour palette (greyscale texture): the surface's brightness picks its colour from it (fire: dark red to yellow)
+    let pal = null; try { const g = sizedStr(o + 24); if (g.s && g.s.length < 260) pal = /^textures[\\/]/i.test(g.s) ? g.s : 'textures\\' + g.s; } catch (e) { pal = null; }
+    const P = s => s ? (/^textures[\\/]/i.test(s) ? s : 'textures\\' + s) : null;
+    return { tex: P(src.s), skip: false, uvo, uvs, twoSided: !!(f2 & 0x10), fx: { emis, mult: isFinite(mult) ? mult : 1, uv: uvAnim(ctl, 6, 8), pal } };
+  };
   const shaderTex = (ref) => {
     const none = { tex: null, skip: true };
+    const eff = effShader(ref); if (eff) return eff;
     if (ref < 0 || ref >= numBlocks) return none;
     const ty = btype[ref]; let o = bstart[ref];
-    if (ty !== 'BSLightingShaderProperty') return none;   // water, sky, effects, glow planes: not solid
+    if (ty === 'BSWaterShaderProperty') return { tex: null, skip: false, water: true, uvo: [0, 0], uvs: [1, 1] };   // a water surface: drawn as water
+    if (ty !== 'BSLightingShaderProperty') return none;   // sky, effects, glow planes: not solid
     if (bsver <= 130) o += 4; // skyrim shader type
-    o += 4; const nExtra = dv.getUint32(o, true); o += 4 + nExtra * 4; o += 4; // name, extra, controller
+    o += 4; const nExtra = dv.getUint32(o, true); o += 4 + nExtra * 4; const lctl = dv.getInt32(o, true); o += 4; // name, extra, controller
     const f1 = dv.getUint32(o, true), f2 = dv.getUint32(o + 4, true); o += 8;
     const uvo = [dv.getFloat32(o, true), dv.getFloat32(o + 4, true)], uvs = [dv.getFloat32(o + 8, true), dv.getFloat32(o + 12, true)]; o += 16;
     const ts = dv.getInt32(o, true);
-    const out = { tex: null, skip: false, uvo, uvs, twoSided: !!(f2 & 0x10) };
+    const out = { tex: null, skip: false, uvo, uvs, twoSided: !!(f2 & 0x10), lctl };
     void f1;
     if (ts < 0 || btype[ts] !== 'BSShaderTextureSet') return out;
     let q = bstart[ts]; const n = dv.getInt32(q, true); q += 4;
@@ -3046,7 +3531,13 @@ function parseNif(u8) {
     return { test: !!(flags & 0x200), blend: !!(flags & 1), thr: (flags & 0x200) ? thr / 255 : 0.5 };
   };
 
-  const shapes = [];
+  // how a see-through effect mixes with what is behind it: [source, destination] factors (0 = one, 6 = source alpha, 7 = 1 - source alpha)
+  const blendOf = ref => {
+    if (ref < 0 || ref >= numBlocks || btype[ref] !== 'NiAlphaProperty') return [6, 7];
+    let o = bstart[ref]; o += 4; const nExtra = dv.getUint32(o, true); o += 4 + nExtra * 4 + 4;
+    const fl = dv.getUint16(o, true); return [(fl >> 1) & 15, (fl >> 5) & 15];
+  };
+  const shapes = [], psys = [], nodeW = new Map();
   const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
   const visited = new Set();
   const readSkinPartition = skinRef => {
@@ -3089,7 +3580,7 @@ function parseNif(u8) {
   };
   // The game replaces the root node's own transform with the reference's position/rotation/scale,
   // so whatever the root node stores in the file is ignored in game (and here).
-  const visit = (i, P, isRoot) => {
+  const visit = (i, P, isRoot, bb) => {
     if (i < 0 || i >= numBlocks || visited.has(i)) return;
     visited.add(i);
     const ty = btype[i];
@@ -3098,11 +3589,23 @@ function parseNif(u8) {
       if (av.flags & 1) return; // hidden
       if (/editormarker|collision|^marker|occlusion/i.test(av.name)) return;
       const W = isRoot ? P : compose(P, toCol(av));
+      nodeW.set(i, W);
       let o = av.o;
       const n = dv.getUint32(o, true); o += 4;
       const kids = []; for (let k = 0; k < n; k++) kids.push(dv.getInt32(o + k * 4, true));
       const only = (ty === 'NiLODNode' || ty === 'NiSwitchNode') ? kids.slice(0, 1) : kids;
-      for (const k of only) visit(k, W);
+      // a billboard node turns its children toward the camera (0, 2, 3, 4: facing it; 1, 5, 9: turning only around the up axis)
+      let bbHere = bb;
+      if (ty === 'NiBillboardNode') { let q = o + n * 4; if (bsver < 130) { const ne = dv.getUint32(q, true); q += 4 + ne * 4; } const mode = dv.getUint16(q, true); bbHere = { c: W.t.slice(), mode: [1, 5, 9].includes(mode) ? 1 : 2 }; }
+      for (const k of only) visit(k, W, false, bbHere);
+    } else if (ty === 'NiParticleSystem') {
+      const av = readAV(bstart[i]);
+      if (av.flags & 1) return;
+      const W = isRoot ? P : compose(P, toCol(av));
+      let o = av.o + 16; if (bsver >= 155) o += 24;
+      o += 4; const shader = dv.getInt32(o, true), alpha = dv.getInt32(o + 4, true);
+      const data = dv.getInt32(o + 24, true);   // after the alpha, the vertex description and the LOD distances
+      psys.push({ i, W, shader, alpha, data });
     } else if (TRISHAPE_TYPES.has(ty)) {
       const av = readAV(bstart[i]);
       if (av.flags & 1) return;
@@ -3132,7 +3635,8 @@ function parseNif(u8) {
       const uvOff = ((lo >>> 8) & 0xF) * 4, nOff = ((lo >>> 16) & 0xF) * 4, cOff = ((lo >>> 24) & 0xF) * 4;
       const sh = shaderTex(shader);
       if (sh.skip) return;
-      if (sh.tex && /^(textures[\\/])?(effects|water)[\\/]|_n\.dds$|_msn\.dds$/i.test(sh.tex)) return;
+      if (sh.tex && /_n\.dds$|_msn\.dds$/i.test(sh.tex)) return;
+      if (!sh.fx && sh.tex && /^(textures[\\/])?(effects|water)[\\/]/i.test(sh.tex)) sh.fx = { emis: [1, 1, 1, 1], mult: 1, uv: uvAnim(sh.lctl, 20, 22), lit: true };   // flowing water drawn with the normal shader
       const uv = (attrs & 2) ? new Float32Array(nVert * 2) : null;
       const full = bsver < 130 || (attrs & 0x400);
       const pos = new Float32Array(nVert * 3), nrm = new Float32Array(nVert * 3);
@@ -3162,7 +3666,7 @@ function parseNif(u8) {
         idx = new Uint16Array(nTri * 3);
         for (let t = 0; t < nTri * 3; t++) idx[t] = dv.getUint16(o + t * 2, true);
       }
-      shapes.push({ pos, nrm, col, va, uv, idx, tex: sh.tex, alpha: alphaInfo(alpha) });
+      shapes.push({ pos, nrm, col, va, uv, idx, tex: sh.tex, alpha: sh.water ? null : alphaInfo(alpha), water: !!sh.water, fx: sh.fx || null, blend: sh.fx ? blendOf(alpha) : null, bb: bb || null });
     } else if (GEOM_TYPES.has(ty)) {
       const av = readAV(bstart[i]);
       if (av.flags & 1) return;
@@ -3179,7 +3683,8 @@ function parseNif(u8) {
       if (dty !== 'NiTriShapeData' && dty !== 'NiTriStripsData') return;
       const sh = shaderTex(shader);
       if (sh.skip) return;
-      if (sh.tex && /^(textures[\\/])?(effects|water)[\\/]|_n\.dds$|_msn\.dds$/i.test(sh.tex)) return;
+      if (sh.tex && /_n\.dds$|_msn\.dds$/i.test(sh.tex)) return;
+      if (!sh.fx && sh.tex && /^(textures[\\/])?(effects|water)[\\/]/i.test(sh.tex)) sh.fx = { emis: [1, 1, 1, 1], mult: 1, uv: uvAnim(sh.lctl, 20, 22), lit: true };   // flowing water drawn with the normal shader
       let q = bstart[dataRef];
       q += 4;                                   // group id
       const nVert = dv.getUint16(q, true); q += 2;
@@ -3239,12 +3744,84 @@ function parseNif(u8) {
           const a = Math.round(Math.max(0, Math.min(1, dv.getFloat32(cb + 12, true))) * 255); if (a < 255 && !vaN) vaN = new Uint8Array(nVert).fill(255); if (vaN) vaN[v] = a; }
         if (uv) { const ub = uvOff + v * 8; uv[v * 2] = dv.getFloat32(ub, true) * sh.uvs[0] + sh.uvo[0]; uv[v * 2 + 1] = dv.getFloat32(ub + 4, true) * sh.uvs[1] + sh.uvo[1]; }
       }
-      shapes.push({ pos, nrm, col, va: vaN, uv, idx, tex: sh.tex, alpha: alphaInfo(alpha) });
+      shapes.push({ pos, nrm, col, va: vaN, uv, idx, tex: sh.tex, alpha: sh.water ? null : alphaInfo(alpha), water: !!sh.water, fx: sh.fx || null, blend: sh.fx ? blendOf(alpha) : null, bb: bb || null });
     }
   };
   // roots: blocks not referenced as children — the first block is the root in practice
   visit(0, { r: [1, 0, 0, 0, 1, 0, 0, 0, 1], t: [0, 0, 0], s: 1 }, true);
-  return { shapes, min, max, bsver };
+  /* Particle systems (smoke, steam, splashes, mist): what each emitter sends out, where, how fast, for how long. The 3D view
+     moves the particles from this; the game's own simulation has more to it (forces, colour over time), so this is close, not exact. */
+  const particles = [];
+  for (const ps of psys) {
+    const sh = effShader(ps.shader) || { tex: null, fx: { emis: [1, 1, 1, 1], mult: 1 } };
+    let rate = 0, grav = [0, 0, 0], frames = 1, rects = null, fadeIn = 0.12, fadeOut = 0.35, peak = 1, grow = 1, colKeys = null, scaleCurve = null, spin = null;
+    const drag = [];   // [{a: axis, k: per second}]: how fast each direction slows down
+    // the parts of a texture sheet the particles use (each particle shows one): [u, width, v, height], at the end of its data block
+    if (ps.data >= 0 && ps.data < numBlocks && btype[ps.data] === 'NiPSysData') {
+      const o = bstart[ps.data], sz = bsize[ps.data];
+      for (let n = 1; n <= 64 && !rects; n++) { const c = o + sz - 19 - 16 * n - 4; if (c < o) break; if (dv.getUint32(c, true) !== n) continue;
+        const r = []; for (let k = 0; k < n; k++) r.push([0, 1, 2, 3].map(j => dv.getFloat32(c + 4 + k * 16 + j * 4, true)));
+        const good = r.filter(q => q.every(v => v >= 0 && v <= 1.0001) && q[1] > 0 && q[3] > 0 && q[0] + q[1] <= 1.0001 && q[2] + q[3] <= 1.0001);
+        if (good.length) rects = good; }
+    }
+    for (let b = 0; b < numBlocks; b++) {
+      const o = bstart[b], ty = btype[b];
+      if ((ty === 'NiPSysEmitterCtlr' || ty === 'BSPSysMultiTargetEmitterCtlr') && dv.getInt32(o + 22, true) === ps.i) { const fk = floatKeys(dv.getInt32(o + 26, true)); if (fk) rate = Math.max(fk.value || 0, ...fk.keys.map(k => k[1]), 0); }
+      if (ty === 'NiPSysDragModifier' && dv.getInt32(o + 8, true) === ps.i) {
+        const go = dv.getInt32(o + 13, true), ax = [dv.getFloat32(o + 17, true), dv.getFloat32(o + 21, true), dv.getFloat32(o + 25, true)], pc = dv.getFloat32(o + 29, true);
+        const G = nodeW.get(go), R = G ? G.r : [1, 0, 0, 0, 1, 0, 0, 0, 1], w = [0, 1, 2].map(k => R[k * 3] * ax[0] + R[k * 3 + 1] * ax[1] + R[k * 3 + 2] * ax[2]), l = Math.hypot(...w);
+        if (l > 1e-6 && isFinite(pc) && pc > 0) drag.push({ a: w.map(v => v / l), k: pc * 60 });   // the percentage is taken off each frame (60 a second)
+      }
+      // colour over life: fades in and out, and how see-through at most
+      if (ty === 'BSPSysSimpleColorModifier' && dv.getInt32(o + 8, true) === ps.i) {
+        const f = k => dv.getFloat32(o + 13 + k * 4, true); if (isFinite(f(0)) && isFinite(f(1))) { fadeIn = Math.max(0.01, f(0)); fadeOut = Math.max(0.01, f(1)); }
+        const a2 = f(13); if (isFinite(a2) && a2 > 0) peak = Math.min(1, a2);
+        // the three colours over its life (each RGBA) and where it moves from one to the next
+        const pc = [f(2), f(3), f(4), f(5)], cols = [0, 1, 2].map(c => [0, 1, 2, 3].map(k => Math.max(0, Math.min(1, f(6 + c * 4 + k)))));
+        if (pc.every(isFinite) && cols.every(c => c.every(isFinite))) colKeys = { pc, cols };
+      }
+      // spin: radians a second (with its spread), and the starting angle
+      if (ty === 'NiPSysRotationModifier' && dv.getInt32(o + 8, true) === ps.i) {
+        const f = k => dv.getFloat32(o + 13 + k * 4, true); spin = { speed: f(0), sv: f(1), a0: f(2), av: f(3), sign: u8[o + 29] === 1 };
+        if (!Object.values(spin).every(v => typeof v === 'boolean' || isFinite(v))) spin = null;
+      }
+      // size over life: the last step of the scale curve
+      if (ty === 'BSPSysScaleModifier' && dv.getInt32(o + 8, true) === ps.i) { const n = dv.getUint32(o + 13, true); if (n > 0 && n < 4000 && 17 + n * 4 <= bsize[b]) {
+        const all = []; for (let k = 0; k < n; k++) all.push(dv.getFloat32(o + 17 + k * 4, true));
+        if (all.every(isFinite)) { scaleCurve = Array.from({ length: Math.min(32, n) }, (_, k) => all[Math.round(k * (n - 1) / Math.max(1, Math.min(32, n) - 1))]); grow = Math.min(20, all[n - 1] || 1); } } }
+      // a frame sheet (smoke, steam, fire): the particle steps through its frames over its life
+      if (ty === 'BSPSysSubTexModifier' && dv.getInt32(o + 8, true) === ps.i) { const end = dv.getFloat32(o + 21, true); if (isFinite(end) && end >= 1) frames = Math.round(end) + 1; }
+      if (ty === 'NiPSysGravityModifier' && dv.getInt32(o + 8, true) === ps.i) {
+        const go = dv.getInt32(o + 13, true), ax = [dv.getFloat32(o + 17, true), dv.getFloat32(o + 21, true), dv.getFloat32(o + 25, true)], str = dv.getFloat32(o + 33, true);
+        const G = nodeW.get(go), R = G ? G.r : [1, 0, 0, 0, 1, 0, 0, 0, 1];
+        for (let k = 0; k < 3; k++) grav[k] += str * (R[k * 3] * ax[0] + R[k * 3 + 1] * ax[1] + R[k * 3 + 2] * ax[2]);
+      }
+    }
+    for (let b = 0; b < numBlocks; b++) {
+      const ty = btype[b]; if (!/^NiPSys(Box|Sphere|Cylinder|Mesh)Emitter$/.test(ty)) continue;
+      const o = bstart[b]; if (dv.getInt32(o + 8, true) !== ps.i) continue;
+      const f = k => dv.getFloat32(o + 13 + k * 4, true);
+      const e = { speed: f(0), sv: f(1), decl: f(2), dv: f(3), planar: f(4), pv: f(5), color: [f(6), f(7), f(8), f(9)], radius: f(10), rv: f(11), life: f(12), lv: f(13) };
+      let frame = ps.W, box = [0, 0, 0];
+      if (ty !== 'NiPSysMeshEmitter') {
+        const eo = dv.getInt32(o + 69, true); if (nodeW.has(eo)) frame = nodeW.get(eo);
+        if (ty === 'NiPSysBoxEmitter') box = [dv.getFloat32(o + 73, true), dv.getFloat32(o + 77, true), dv.getFloat32(o + 81, true)];
+        else if (ty === 'NiPSysSphereEmitter') { const r = dv.getFloat32(o + 73, true); box = [r * 2, r * 2, r * 2]; }
+        else { const r = dv.getFloat32(o + 73, true); box = [r * 2, r * 2, dv.getFloat32(o + 77, true)]; }
+      }
+      const ok = v => isFinite(v) ? v : 0;
+      particles.push({ origin: frame.t.slice(), R: frame.r.slice(), scale: frame.s || 1, box: box.map(v => ok(v) * (frame.s || 1)), speed: ok(e.speed), sv: ok(e.sv), decl: ok(e.decl), dv: ok(e.dv), planar: ok(e.planar), pv: ok(e.pv),
+        color: e.color.map(v => Math.max(0, Math.min(1, ok(v)))), radius: Math.max(1, ok(e.radius)) * (frame.s || 1), rv: ok(e.rv), life: Math.max(0.1, ok(e.life)), lv: ok(e.lv), rate: ok(rate), grav,
+        tex: sh.tex, pal: sh.fx.pal || null, emis: sh.fx.emis, mult: sh.fx.mult, blend: blendOf(ps.alpha), frames, grid: Math.ceil(Math.sqrt(frames)), rects, drag, fadeIn, fadeOut, peak, grow, colKeys, scaleCurve, spin });
+      { // the space the particles fill (emitter box, how far they travel, their size): the object's box, so it can be clicked
+        const P = particles[particles.length - 1], L = P.life, up = [P.R[2], P.R[5], P.R[8]], m = P.radius * 2;
+        const end = [0, 1, 2].map(k => P.origin[k] + up[k] * P.speed * L * P.scale + 0.5 * P.grav[k] * L * L);
+        const half = Math.max(...P.box) / 2 + m;
+        for (const q of [P.origin, end]) for (let k = 0; k < 3; k++) { min[k] = Math.min(min[k], q[k] - half); max[k] = Math.max(max[k], q[k] + half); }
+      }
+    }
+  }
+  return { shapes, min, max, bsver, particles };
 }
 
 /* ---------------- DDS average colour ---------------- */
@@ -3486,7 +4063,17 @@ precision highp float; precision highp sampler2DArray;
 in vec3 vNor; in vec3 vCol; in vec3 vVc; in vec4 vW0; in vec4 vW1; in vec2 vW; in float vDepth; in vec3 vP;
 uniform sampler2DArray uArr; uniform float uL[8]; uniform vec3 uSun; uniform vec3 uSky; uniform float uFog; uniform vec2 uOrigin;
 uniform sampler2D uShadow; uniform mat4 uLMVP; uniform float uShOn; uniform float uShTexel; uniform float uShRange;
-uniform vec3 uSunCol; uniform vec3 uAmb;
+uniform vec3 uSunCol; uniform vec3 uAmb; uniform float uBlend;
+// "Natural" ground look: edges between textures get an organic, uneven shape (as modern terrain shaders draw them, instead of
+// straight steps along the triangles), and each texture is mixed with a turned, rescaled copy of itself so it does not repeat.
+float hash2(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash2(i), hash2(i + vec2(1.0, 0.0)), f.x), mix(hash2(i + vec2(0.0, 1.0)), hash2(i + vec2(1.0, 1.0)), f.x), f.y); }
+vec3 sampT(float L, vec2 uv, float n){
+  vec3 a = texture(uArr, vec3(uv, L)).rgb; if (uBlend < 0.5) return a;
+  vec3 b = texture(uArr, vec3(mat2(0.8, -0.6, 0.6, 0.8) * uv * 0.71 + vec2(0.37, 0.11), L)).rgb;
+  return mix(a, b, smoothstep(0.3, 0.7, n));
+}
 float shadowAt(vec3 p, float nd){
   if (uShOn < 0.5) return 1.0;
   vec4 lp = uLMVP * vec4(p, 1.0); vec3 q = lp.xyz / lp.w * 0.5 + 0.5;
@@ -3500,7 +4087,22 @@ void main(){
   vec2 uv = (vW + uOrigin) / 341.3333;
   float w[8] = float[8](vW0.x, vW0.y, vW0.z, vW0.w, vW1.x, vW1.y, vW1.z, vW1.w);
   vec3 c = vec3(0.0); float ws = 0.0;
-  for (int i = 0; i < 8; i++) { if (w[i] > 0.003 && uL[i] >= 0.0) { c += w[i] * texture(uArr, vec3(uv, uL[i])).rgb; ws += w[i]; } }
+  vec2 wp = vW + uOrigin; float tn = vnoise(wp / 900.0);
+  if (uBlend < 0.5) { for (int i = 0; i < 8; i++) { if (w[i] > 0.003 && uL[i] >= 0.0) { c += w[i] * sampT(uL[i], uv, tn); ws += w[i]; } } }
+  else {
+    vec3 cs[8]; float hs[8]; float mx = -10.0;
+    for (int i = 0; i < 8; i++) {
+      hs[i] = -10.0; cs[i] = vec3(0.0);
+      if (w[i] > 0.003 && uL[i] >= 0.0) {
+        cs[i] = sampT(uL[i], uv, tn);
+        // only where a texture is fading in or out (weight between 0 and 1) does the noise move the edge: no texture grows or shrinks overall
+        float edge = 4.0 * w[i] * (1.0 - w[i]), h = dot(cs[i], vec3(0.299, 0.587, 0.114)) - 0.45;
+        hs[i] = w[i] + edge * ((vnoise(wp / 70.0 + float(i) * 17.3) - 0.5) * 0.45 + (vnoise(wp / 23.0 + float(i) * 5.1) - 0.5) * 0.2 + h * 0.25);
+        mx = max(mx, hs[i]);
+      }
+    }
+    for (int i = 0; i < 8; i++) { if (hs[i] > -5.0) { float b = max(hs[i] - mx + 0.22, 0.0); c += b * cs[i]; ws += b; } }
+  }
   c = ws > 0.0 ? (c / ws) * vVc : vCol;
   vec3 n = normalize(vNor); float d = max(dot(n, uSun), 0.0);
   c *= (uAmb + uSunCol * d * shadowAt(vP, d));
@@ -3542,6 +4144,33 @@ uniform mat4 uMVP; uniform float uExag; uniform float uPt;
 varying vec4 vCol;
 void main(){ vCol = aCol; gl_Position = uMVP * vec4(aPos.xy, aPos.z * uExag, 1.0); gl_PointSize = uPt; }`;
 const FLAT_FS = `precision mediump float; varying vec4 vCol; void main(){ gl_FragColor = vCol; }`;
+// Effects (waterfalls, steam, smoke, mist): see-through surfaces whose texture flows, and particles
+const FXS_VS = `
+attribute vec3 aPos; attribute vec2 aUv; attribute float aA; attribute vec3 aBB; attribute float aMode;
+uniform mat4 uMVP; uniform float uExag; uniform vec3 uCam; varying vec2 vUv; varying float vA;
+void main(){ vUv = aUv; vA = aA; vec3 p = aPos;
+  if (aMode > 0.5) {   // billboard: aPos is its centre, aBB its place across / up / out of the plane, turned toward the camera
+    vec3 tc = uCam - aPos; vec3 N = aMode < 1.5 ? vec3(tc.xy, 0.0) : tc; N = length(N) > 0.001 ? normalize(N) : vec3(0.0, -1.0, 0.0);
+    vec3 U = aMode < 1.5 ? vec3(0.0, 0.0, 1.0) : normalize(vec3(0.0, 0.0, 1.0) - N.z * N + vec3(0.0001)); vec3 R = normalize(cross(U, N));
+    p = aPos + aBB.x * R + aBB.y * U + aBB.z * N; }
+  gl_Position = uMVP * vec4(p.xy, p.z * uExag, 1.0); }`;
+const FXS_FS = `precision mediump float;
+uniform sampler2D uTex; uniform float uHasTex; uniform vec4 uCol; uniform vec2 uOff; uniform sampler2D uPal; uniform float uHasPal; varying vec2 vUv; varying float vA;
+void main(){ vec4 t = uHasTex > 0.5 ? texture2D(uTex, vUv + uOff) : vec4(1.0);
+  if (uHasPal > 0.5) { vec4 pc = texture2D(uPal, vec2(clamp(dot(t.rgb, vec3(0.3, 0.59, 0.11)), 0.02, 0.98), 0.5)); t = vec4(pc.rgb, t.a * pc.a); }   // colour from the palette
+  float a = clamp(t.a * uCol.a * vA, 0.0, 1.0); if (a < 0.004) discard; gl_FragColor = vec4(min(t.rgb * uCol.rgb, vec3(1.0)), a); }`;
+const FXP_VS = `
+attribute vec3 aPos; attribute float aSize; attribute float aA; attribute float aF; attribute vec4 aRect; attribute float aRot; attribute vec3 aPc;
+uniform mat4 uMVP; uniform float uExag; uniform float uPx; varying float vA; varying float vF; varying vec4 vRect; varying float vRot; varying vec3 vPc;
+void main(){ vA = aA; vF = aF; vRect = aRect; vRot = aRot; vPc = aPc; gl_Position = uMVP * vec4(aPos.xy, aPos.z * uExag, 1.0); gl_PointSize = clamp(aSize * 1.41421 * uPx / max(gl_Position.w, 1.0), 1.0, 512.0); }`;   // room for the sprite to turn
+const FXP_FS = `precision mediump float;
+uniform sampler2D uTex; uniform float uHasTex; uniform vec4 uCol; uniform float uGrid; uniform sampler2D uPal; uniform float uHasPal; varying float vA; varying float vF; varying vec4 vRect; varying float vRot; varying vec3 vPc;
+void main(){ vec2 pc = gl_PointCoord - 0.5; float cs = cos(vRot), sn = sin(vRot); pc = vec2(cs * pc.x - sn * pc.y, sn * pc.x + cs * pc.y) * 1.41421 + 0.5;   // turned (the sprite's corners stay inside)
+  if (pc.x < 0.0 || pc.y < 0.0 || pc.x > 1.0 || pc.y > 1.0) discard; float g = max(uGrid, 1.0), cx = mod(vF, g), cy = floor(vF / g);
+  vec2 uv = vRect.y > 0.0 ? vec2(vRect.x + pc.x * vRect.y, vRect.z + pc.y * vRect.w) : (vec2(cx, cy) + pc) / g;
+  vec4 t = uHasTex > 0.5 ? texture2D(uTex, uv) : vec4(0.8, 0.8, 0.82, 0.5 * (1.0 - smoothstep(0.1, 0.5, length(pc - 0.5))));
+  if (uHasPal > 0.5) { vec4 pq = texture2D(uPal, vec2(clamp(dot(t.rgb, vec3(0.3, 0.59, 0.11)), 0.02, 0.98), 0.5)); t = vec4(pq.rgb, t.a * pq.a); }
+  float a = clamp(t.a * uCol.a * vA, 0.0, 1.0); if (a < 0.004) discard; gl_FragColor = vec4(min(t.rgb * uCol.rgb * vPc, vec3(1.0)), a); }`;
 // Shadow map: depth from the sun (instanced trees included, see-through leaves cut out)
 const SHD_VS = `
 attribute vec3 aPos; attribute vec2 aUv; attribute vec3 iR0; attribute vec3 iR1; attribute vec3 iR2; attribute vec3 iT;
@@ -3607,12 +4236,14 @@ function createView3D(host, deps) {
       <button class="v3-big v3-lightb" title="Weather and time of day, sun shadows, ENB-style look, texture detail">🎨 Graphics</button>
       <button class="v3-big v3-pvb" style="display:none" title="Shows the ground as it would be with the patch (seam fixes), before creating it. Click again to go back.">👁 Preview patch</button>
       <button class="v3-big v3-mkb" style="display:none" title="Downloads the patch: seam fixes, ticked warnings and your ground edits">🛠 Create patch</button>
-      <button class="v3-big v3-ident" title="Click an object to see what it is and which mod placed it. You can then disable it and put that in a patch.">🔍 Identify / disable object</button>
+      <button class="v3-big v3-ident" title="Click an object to see what it is and which mod placed it. You can then disable it, drop a floating one to the ground or nudge it, and put that in a patch.">🔍 Identify / disable / move object</button>
       <button class="v3-big v3-terrab" title="Lower or raise the ground with a brush. Neighbouring cells follow, and the edits go into the patch.">⛏ Terraform</button>
+      <button class="v3-big v3-texb" title="Remove a ground texture (snow, for example) or paint one with a brush. Cell borders stay matched, and the strokes go into the patch.">🖌 Paint textures</button>
       <button class="v3-big v3-grassb" title="Click the ground to see which grass can grow there, which mods decide it, and whether any of its files are missing (missing textures show purple in game)">🌿 Identify grass</button>
     </div>
     <label class="chip"><input type="checkbox" data-a="structs" checked> Structures</label>
     <label class="chip"><input type="checkbox" data-a="water" checked> Water</label>
+    <label class="chip" title="Waterfalls, smoke, steam, mist and fire, moving as in game"><input type="checkbox" data-a="fx" checked> Effects</label>
     <label class="chip" title="The invisible paths NPCs walk on (navmesh). Green = fine, red = no longer on the ground because a mod changed the terrain, pink = a link to the next navmesh that no longer holds."><input type="checkbox" data-a="nav"> Navmesh</label>
     <label class="chip t-height"><input type="checkbox" data-a="walls" checked> Seam markers</label>
     <label class="chip" title="Cell coordinates written on the ground"><input type="checkbox" data-a="nums" checked> Cell numbers</label>
@@ -3622,6 +4253,7 @@ function createView3D(host, deps) {
     <span class="v3-status"></span>
     <span class="v3-hidbar" style="display:none"></span>
     <span class="v3-terbar v3-hidbar" style="display:none"></span>
+    <button class="small v3-fxexp" title="Saves the effect models (waterfalls, smoke, fire, mist) in this view as your load order has them, with where each comes from, so their look can be checked against your game">📦 Export effects</button>
     <button class="small v3-report" data-a="report" title="Copies what the tool sees around the selected cells (sources, mods, missing objects) so you can paste it in a bug report">📋 Copy report</button>
     <button class="small v3-helpb" title="The tutorial: what every button does">❔ Help</button>
   </div>
@@ -3634,6 +4266,7 @@ function createView3D(host, deps) {
     <label>Time of day <b class="lp-tl">13:00</b><input type="range" class="lp-t" min="0" max="24" step="0.25" value="13"></label>
     <label>Shadows<select class="lp-s"><option value="off">Off</option><option value="medium">Medium</option><option value="high">High (sharper, heavier)</option></select></label>
     <label>Look<select class="lp-l"><option value="off">Plain</option><option value="natural">ENB style: natural</option><option value="warm">ENB style: warm</option><option value="cold">ENB style: cold</option><option value="cinematic">ENB style: cinematic</option><option value="vivid">ENB style: vivid</option></select></label>
+    <label>Ground look<select class="lp-b" title="How the edges between ground textures are drawn"><option value="natural">Natural: uneven edges, no repeating pattern (like modern terrain shaders)</option><option value="plain">Plain: straight blending (the game without terrain shaders)</option></select></label>
     <label>Detail<select class="lp-q"><option value="normal">Normal (fast)</option><option value="high">High: sharper textures</option><option value="ultra">Ultra: sharpest, heavy</option></select></label>
     <div class="muted lp-note"></div>
   </div>
@@ -3671,13 +4304,15 @@ function createView3D(host, deps) {
   }
   const s3tc = gl.getExtension('WEBGL_compressed_texture_s3tc'), bptc = gl.getExtension('EXT_texture_compression_bptc');
   const TER = compile(gl, TER_VS, TER_FS), FLAT = compile(gl, FLAT_VS, FLAT_FS), STR = compile(gl, STR_VS, STR_FS), BLIT = compile(gl, BLIT_VS, BLIT_FS);
+  const FXS = compile(gl, FXS_VS, FXS_FS), FXP = compile(gl, FXP_VS, FXP_FS);
   let TERTEX = null; if (isGL2) { try { TERTEX = compile(gl, TERTEX_VS, TERTEX_FS); } catch (e) { console.warn(e); } }
   let SHD = null, BRIGHT = null, BLUR = null, COMP = null, PICK = null;
   try { PICK = compile(gl, PICK_VS, PICK_FS); } catch (e) { console.warn('pick shader', e); }
   if (isGL2) { try { SHD = compile(gl, SHD_VS, SHD_FS); BRIGHT = compile(gl, POST_VS, BRIGHT_FS); BLUR = compile(gl, POST_VS, BLUR_FS); COMP = compile(gl, POST_VS, COMP_FS); } catch (e) { console.warn(e); } }
   const hdrOK = isGL2 && !!gl.getExtension('EXT_color_buffer_float');
+  // each quarter of a cell has its own 17 x 17 vertices (the lines between quarters twice), as the game draws them
   const idx = new Uint16Array(32 * 32 * 6);
-  { let k = 0; for (let r = 0; r < 32; r++) for (let c = 0; c < 32; c++) { const a = r * 33 + c; idx[k++] = a; idx[k++] = a + 1; idx[k++] = a + 33; idx[k++] = a + 1; idx[k++] = a + 34; idx[k++] = a + 33; } }
+  { let k = 0; for (let q = 0; q < 4; q++) for (let r = 0; r < 16; r++) for (let c = 0; c < 16; c++) { const a = q * 289 + r * 17 + c; idx[k++] = a; idx[k++] = a + 1; idx[k++] = a + 17; idx[k++] = a + 1; idx[k++] = a + 18; idx[k++] = a + 17; } }
   const ibo = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
   const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
 
@@ -3740,7 +4375,8 @@ function createView3D(host, deps) {
   /** Ground textures live in one texture array. New textures go into free layers; the array is only
       reallocated (bigger) when it is full, so adding cells doesn't reload what is already there. */
   async function uploadLayer(arr, i, id, SZ, fb) {
-    const name = ctx().texNames[id] || 'default';
+    // a quarter with no base texture shows the engine's standard ground, landscape\dirt02.dds (as the game does)
+    const raw = ctx().texNames[id] || 'default', name = raw === 'default' ? 'landscape\\dirt02.dds' : raw;
     const path = /\.dds$/.test(name) ? name : null;
     const td = path ? await deps.assets().textureData(path, SZ) : null;
     if (arr !== st.arrPending && arr !== st.arr) return false;
@@ -3807,15 +4443,16 @@ function createView3D(host, deps) {
     // c.ghost: the city worldspace has no ground of its own here; the game fills it with the parent's (Tamriel) distant terrain
     const v = versionOf(c); if (!v) return null;
     const d = full(v); if (!d.heights) return null;
-    const H = d.heights, data = new Float32Array(1089 * 20);
+    const H = d.heights, data = new Float32Array(1156 * 20);
     const ox = c.x * 4096 - st.origin[0], oy = c.y * 4096 - st.origin[1];
     const R = realOf(v);
     // up to 8 ground textures for this cell, by total weight
     const tot = new Map();
     if (d.texK) for (let i = 0; i < d.texK.length; i++) { const t = d.texK[i]; if (t >= 0) tot.set(t, (tot.get(t) || 0) + d.texW[i]); }
     const slots = [...tot].sort((a, b) => b[1] - a[1]).slice(0, 8).map(x => x[0]);
-    for (let r = 0; r < 33; r++) for (let cc = 0; cc < 33; cc++) {
-      const k = r * 33 + cc, o = k * 20;
+    for (let vi = 0; vi < 1156; vi++) {
+      const qd = Math.floor(vi / 289), lr = Math.floor((vi % 289) / 17), lc = vi % 17, r = (qd & 2 ? 16 : 0) + lr, cc = (qd & 1 ? 16 : 0) + lc;
+      const k = r * 33 + cc, o = vi * 20;
       data[o] = ox + cc * 128; data[o + 1] = oy + r * 128; data[o + 2] = H[k] - st.origin[2];
       let nx = 0, ny = 0, nz = 1;
       if (d.normals) { nx = d.normals[k * 3]; ny = d.normals[k * 3 + 1]; nz = d.normals[k * 3 + 2]; }
@@ -3823,7 +4460,8 @@ function createView3D(host, deps) {
       data[o + 3] = nx / nl; data[o + 4] = ny / nl; data[o + 5] = nz / nl;
       if (R) { data[o + 6] = R[k * 3] / 255; data[o + 7] = R[k * 3 + 1] / 255; data[o + 8] = R[k * 3 + 2] / 255; } else { data[o + 6] = 0.5; data[o + 7] = 0.5; data[o + 8] = 0.45; }
       if (d.colors) { data[o + 9] = d.colors[k * 3] / 255; data[o + 10] = d.colors[k * 3 + 1] / 255; data[o + 11] = d.colors[k * 3 + 2] / 255; } else { data[o + 9] = data[o + 10] = data[o + 11] = 1; }
-      if (d.texK) for (let j = 0; j < 3; j++) { const s = slots.indexOf(d.texK[k * 3 + j]); if (s >= 0) data[o + 12 + s] += d.texW[k * 3 + j]; }
+      if (d.texKQ) { for (let j = 0; j < 8; j++) { const s = slots.indexOf(d.texKQ[vi * 8 + j]); if (s >= 0) data[o + 12 + s] += d.texWQ[vi * 8 + j]; } }
+      else if (d.texK) { const N = d.texN || 3; for (let j = 0; j < N; j++) { const s = slots.indexOf(d.texK[k * N + j]); if (s >= 0) data[o + 12 + s] += d.texW[k * N + j]; } }
     }
     const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
     return { vbo, c, v, slots };
@@ -3834,7 +4472,12 @@ function createView3D(host, deps) {
     const v = versionOf(c), had = st.meshCache.get(c);
     if (had !== undefined && (had ? had.v === v : !v)) return had;
     if (had) gl.deleteBuffer(had.vbo);
-    const m = buildCellMesh(c); st.meshCache.set(c, m); return m;
+    const m = buildCellMesh(c); if (m) m.hideQ = (c.cellWin && c.cellWin.hideQ) || 0; st.meshCache.set(c, m); return m;
+  }
+  /* A cell's ground, less the quarters its cell record tells the game to hide (city cells whose streets are a model of their own). */
+  function drawTer(m) {
+    if (!m.hideQ) { gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0); return; }
+    for (let q = 0; q < 4; q++) if (!(m.hideQ & (1 << q))) gl.drawElements(gl.TRIANGLES, 1536, gl.UNSIGNED_SHORT, q * 1536 * 2);
   }
   function clearMeshCache() { if (st.meshCache) for (const m of st.meshCache.values()) if (m) gl.deleteBuffer(m.vbo); st.meshCache = new Map(); }
   function rebuild() {
@@ -3907,7 +4550,7 @@ function createView3D(host, deps) {
   function buildFlat() {
     buildNav();
     const tris = [], lines = [];
-    if (st.water) for (const c of st.cells) {
+    if (st.water) for (const c of [...st.cells, ...st.ring]) {     // the surrounding ground has its rivers and lakes too
       const wl = TSI.waterLevel(WO(c), c, c.cellWin); if (wl == null) continue;
       const x0 = c.x * 4096, y0 = c.y * 4096, col = [0.16, 0.30, 0.38, 0.86];
       push(tris, x0, y0, wl, col); push(tris, x0 + 4096, y0, wl, col); push(tris, x0, y0 + 4096, wl, col);
@@ -4007,6 +4650,8 @@ function createView3D(host, deps) {
       st.sBatches = []; st.sCells = new Set(); st.sStats = { shown: 0, missing: new Map() }; st.dirty = true;
       st.objs = []; clearGrassTrees();
       st.missTris = []; if (st.missBuf) { gl.deleteBuffer(st.missBuf.b); st.missBuf = null; }
+      st.pwTris = []; st.pwCount = 0;   // placed water: built up batch by batch, like the objects
+      for (const b of st.fxBatches || []) gl.deleteBuffer(b.b); st.fxBatches = []; st.fxEmit = [];   // effects too
     }
     const assets = deps.assets(), refs = deps.refs();
     const status = q('.v3-status');
@@ -4056,21 +4701,80 @@ function createView3D(host, deps) {
     const groups = new Map();
     const why = m => { let k = String(m).toLowerCase().replace(/\\/g, '/'); if (!k.startsWith('meshes/')) k = 'meshes/' + k; return (assets.meshWhy && assets.meshWhy.get(k)) || 'missing'; };
     let shown = 0;
-    const miss = new Map(), boxes = [];
+    const miss = new Map(), boxes = [], waterItems = [], fxItems = [];
     for (const [r, bi] of list) {
-      const m = meshes.get(bi.model);
+      let m = meshes.get(bi.model);
+      // an effect whose model has nothing of its own to draw (chimney smoke made by a shared particle system): a stand-in, so it can be seen and disabled
+      if (!m && bi.fx && /^(meshes[\\/])?effects[\\/]/i.test(bi.model) && why(bi.model) === 'empty') { m = { shapes: [], particles: [], min: [0, 0, 0], max: [0, 0, 0] }; meshes.set(bi.model, m); }
       if (!m) {
         const w = why(bi.model);
         if (w !== 'empty') { const e = miss.get(bi.model) || { n: 0, why: w }; e.n++; miss.set(bi.model, e); if (bi.bounds) { boxes.push([r, bi.bounds]); const b = bi.bounds; (st.objs || (st.objs = [])).push({ r, bi, m: { min: [b[0], b[1], b[2]], max: [b[3], b[4], b[5]], shapes: [], missing: w } }); } }
         continue;
       }
+      if (bi.fx && /cloud/i.test(bi.model + ' ' + bi.edid)) continue;   // clouds: not wanted in the view
+      // beehives and other critter models: their insect swarms are not smoke, so only the solid model is drawn
+      if (/beehive|(^|[\\/])critters[\\/]/i.test(bi.model) && ((m.particles && m.particles.length) || m.shapes.some(s => s.fx))) {
+        const k = bi.model + '|solid'; let m2 = meshes.get(k);
+        if (!m2) { m2 = Object.assign({}, m, { particles: [], shapes: m.shapes.filter(s => !s.fx) }); meshes.set(k, m2); }
+        m = m2; if (!m.shapes.length) continue;
+      }
+      if (bi.fx && /^(meshes[\\/])?effects[\\/]/i.test(bi.model) && !m.shapes.some(s => s.fx || s.water || s.idx.length) && !(m.particles && m.particles.length) && !m._smoke) {
+        // smoke the game makes from a shared particle system elsewhere (chimneys): a plain rising smoke column here, so it can be seen and disabled
+        m._smoke = true; m.particles = [{ origin: [0, 0, 0], R: [1, 0, 0, 0, 1, 0, 0, 0, 1], scale: 1, box: [40, 40, 10], speed: 70, sv: 15, decl: 0, dv: 0.25, planar: 0, pv: 3.14, color: [0.75, 0.75, 0.77, 1], radius: 45, rv: 10, life: 7, lv: 1.5, rate: 3, grav: [0, 0, 4],
+          tex: null, pal: null, emis: [1, 1, 1, 1], mult: 1, blend: [6, 7], frames: 1, grid: 1, rects: null, drag: [{ a: [1, 0, 0], k: 0.4 }, { a: [0, 1, 0], k: 0.4 }], fadeIn: 0.1, fadeOut: 0.5, peak: 0.7, grow: 2.5 }];
+        m.min = [-120, -120, -20]; m.max = [120, 120, 700]; m.smokeStandIn = true;
+      }
       shown++;
       (st.objs || (st.objs = [])).push({ r, bi, m }); const oid = st.objs.length;
+      if (m.particles && m.particles.length) for (const e of m.particles) {     // each emitter, where this object puts it
+        const M = TSIAssets.refMatrix(r), A = M.m, Rr = M.r, s = r.s || 1, o = e.origin;
+        const R = new Array(9); for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) R[i * 3 + j] = Rr[i * 3] * e.R[j] + Rr[i * 3 + 1] * e.R[3 + j] + Rr[i * 3 + 2] * e.R[6 + j];
+        if (m.smokeStandIn) R.splice(0, 9, 1, 0, 0, 0, 1, 0, 0, 0, 1);   // the stand-in smoke rises straight up, whatever the placement's turn
+        const g = [0, 1, 2].map(i => Rr[i * 3] * e.grav[0] + Rr[i * 3 + 1] * e.grav[1] + Rr[i * 3 + 2] * e.grav[2]);
+        const dragW = (e.drag || []).map(d => ({ a: [0, 1, 2].map(i => Rr[i * 3] * d.a[0] + Rr[i * 3 + 1] * d.a[1] + Rr[i * 3 + 2] * d.a[2]), k: d.k }));
+        st.fxEmit.push(Object.assign({}, e, { o: [r.x + A[0] * o[0] + A[1] * o[1] + A[2] * o[2], r.y + A[3] * o[0] + A[4] * o[1] + A[5] * o[2], r.z + A[6] * o[0] + A[7] * o[1] + A[8] * o[2]],
+          R, g: g.map(v => v * s), k: s, oid, dragW, n: Math.max(3, Math.min(80, Math.round(e.rate * e.life) || 12)) }));
+      }
       for (const sh of m.shapes) {
+        if (sh.water) { waterItems.push([r, sh]); continue; }   // placed water (rivers, pools, canals): drawn with the water
+        if (sh.fx) { fxItems.push([r, sh]); continue; }         // effects: drawn see-through, their texture flowing
         const key = (sh.tex || '#' + (sh.rgb || m.rgb).join(',')) + (sh.alpha ? '|a' + sh.alpha.thr.toFixed(2) : '');
         let g = groups.get(key); if (!g) groups.set(key, g = { tex: sh.tex, alpha: sh.alpha ? sh.alpha.thr : 0, rgb: sh.rgb || m.rgb, items: [] });
         g.items.push([r, sh, oid]);
       }
+    }
+    // placed water surfaces, where the game puts them: each object's own position, rotation and size
+    { const wt = st.pwTris || (st.pwTris = []), col = [0.16, 0.30, 0.38, 0.86];
+      for (const [r, sh] of waterItems) {
+        const M = TSIAssets.refMatrix(r), A = M.m, P = sh.pos, I = sh.idx;
+        for (let t = 0; t < I.length; t++) { const v = I[t] * 3, x = P[v], y = P[v + 1], z = P[v + 2]; push(wt, r.x + A[0] * x + A[1] * y + A[2] * z, r.y + A[3] * x + A[4] * y + A[5] * z, r.z + A[6] * x + A[7] * y + A[8] * z, col); }
+      }
+      if (st.pwBuf) gl.deleteBuffer(st.pwBuf.b);
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wt), gl.STATIC_DRAW);
+      st.pwBuf = { b, n: wt.length / 7 }; st.pwCount = (st.pwCount || 0) + waterItems.length;
+      { let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity]; for (let i = 0; i < wt.length; i += 7) for (let k = 0; k < 3; k++) { const q = wt[i + k] + st.origin[k]; if (q < lo[k]) lo[k] = q; if (q > hi[k]) hi[k] = q; } st.pwBounds = st.pwCount ? [lo, hi] : null; }
+    }
+    // effect surfaces: one buffer per shape (each has its own texture, colour and flow speed)
+    for (const [r, sh] of fxItems) {
+      const M = TSIAssets.refMatrix(r), A = M.m, P = sh.pos, I = sh.idx, data = [];
+      { let lo = Infinity, hi = -Infinity, lo2 = Infinity, hi2 = -Infinity; for (let k = 0; k < P.length; k += 3) { lo = Math.min(lo, P[k]); hi = Math.max(hi, P[k]); lo2 = Math.min(lo2, P[k + 1]); hi2 = Math.max(hi2, P[k + 1]); }
+        if (Math.max(hi - lo, hi2 - lo2) * (r.s || 1) > 9000) continue; }
+      const W = k => [r.x + A[0] * P[k * 3] + A[1] * P[k * 3 + 1] + A[2] * P[k * 3 + 2], r.y + A[3] * P[k * 3] + A[4] * P[k * 3 + 1] + A[5] * P[k * 3 + 2], r.z + A[6] * P[k * 3] + A[7] * P[k * 3 + 1] + A[8] * P[k * 3 + 2]];
+      // a billboard (smoke and mist planes the game turns toward the camera): its centre and the plane's own directions
+      let bb = null;
+      if (sh.bb) {
+        const c0 = sh.bb.c, c = [r.x + A[0] * c0[0] + A[1] * c0[1] + A[2] * c0[2], r.y + A[3] * c0[0] + A[4] * c0[1] + A[5] * c0[2], r.z + A[6] * c0[0] + A[7] * c0[1] + A[8] * c0[2]];
+        let n = [0, 0, 0];
+        for (let t = 0; t + 2 < I.length; t += 3) { const p0 = W(I[t]), p1 = W(I[t + 1]), p2 = W(I[t + 2]), u = p1.map((q, k) => q - p0[k]), w = p2.map((q, k) => q - p0[k]); n = [n[0] + u[1] * w[2] - u[2] * w[1], n[1] + u[2] * w[0] - u[0] * w[2], n[2] + u[0] * w[1] - u[1] * w[0]]; }
+        const nl = Math.hypot(...n);
+        if (nl > 1e-6) { n = n.map(q => q / nl); if (Math.abs(n[2]) < 0.9) { let U = [-n[2] * n[0], -n[2] * n[1], 1 - n[2] * n[2]]; const ul = Math.hypot(...U); U = U.map(q => q / ul); const R = [U[1] * n[2] - U[2] * n[1], U[2] * n[0] - U[0] * n[2], U[0] * n[1] - U[1] * n[0]]; bb = { c, n, U, R, mode: sh.bb.mode }; } }
+      }
+      for (let t = 0; t < I.length; t++) { const k = I[t], p = W(k), uvx = sh.uv ? sh.uv[k * 2] : 0, uvy = sh.uv ? sh.uv[k * 2 + 1] : 0, va = sh.va ? sh.va[k] / 255 : 1;
+        if (bb) { const d = p.map((q, j) => q - bb.c[j]), dot = q => d[0] * q[0] + d[1] * q[1] + d[2] * q[2]; data.push(bb.c[0] - st.origin[0], bb.c[1] - st.origin[1], bb.c[2] - st.origin[2], uvx, uvy, va, dot(bb.R), dot(bb.U), dot(bb.n), bb.mode); }
+        else data.push(p[0] - st.origin[0], p[1] - st.origin[1], p[2] - st.origin[2], uvx, uvy, va, 0, 0, 0, 0); }
+      const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+      const mu = Math.min(sh.fx.mult, 1.25), addv = sh.blend && sh.blend[1] === 0;   // the game's brightness boost needs its HDR; here it would turn white
+      st.fxBatches.push({ b, n: I.length, bb: !!bb, tex: sh.tex, pal: sh.fx.pal || null, col: [sh.fx.emis[0] * mu, sh.fx.emis[1] * mu, sh.fx.emis[2] * mu, sh.fx.emis[3] * (addv ? 0.3 : 0.85)], uv: sh.fx.uv, blend: sh.blend || [6, 7] });
     }
     const O = st.origin, out = [];
     let built = 0;
@@ -4387,7 +5091,7 @@ function createView3D(host, deps) {
     gl.uniform1f(SHD.loc.uAlpha, 0);
     if (SHD.loc.aUv >= 0) { gl.disableVertexAttribArray(SHD.loc.aUv); gl.vertexAttrib2f(SHD.loc.aUv, 0, 0); }
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-    for (const m of st.meshes) { gl.bindBuffer(gl.ARRAY_BUFFER, m.vbo); gl.enableVertexAttribArray(SHD.loc.aPos); gl.vertexAttribPointer(SHD.loc.aPos, 3, gl.FLOAT, false, 80, 0); gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0); }
+    for (const m of st.meshes) { gl.bindBuffer(gl.ARRAY_BUFFER, m.vbo); gl.enableVertexAttribArray(SHD.loc.aPos); gl.vertexAttribPointer(SHD.loc.aPos, 3, gl.FLOAT, false, 80, 0); drawTer(m); }
     // objects
     const batch = (b, inst) => {
       const e = texFor(b.tex), t = e && e.t;
@@ -4412,6 +5116,7 @@ function createView3D(host, deps) {
   }
   function setLight(P, L, sky, FOG) {
     gl.uniform3f(P.loc.uSun, ...L.dir); gl.uniform3f(P.loc.uSky, ...sky); gl.uniform1f(P.loc.uFog, FOG);
+    if (P.loc.uBlend != null) gl.uniform1f(P.loc.uBlend, (st.light.blend || 'natural') === 'natural' ? 1 : 0);
     if (P.loc.uSunCol) gl.uniform3f(P.loc.uSunCol, ...L.sun);
     if (P.loc.uAmb) gl.uniform3f(P.loc.uAmb, ...L.amb);
     if (P.loc.uShOn) {
@@ -4488,6 +5193,7 @@ function createView3D(host, deps) {
     gl.enable(gl.DEPTH_TEST); gl.depthMask(true); gl.disable(gl.BLEND);
     const cp = Math.cos(st.pitch);
     const eye = [st.target[0] + st.dist * cp * Math.cos(st.yaw), st.target[1] + st.dist * cp * Math.sin(st.yaw), st.target[2] * st.exag + st.dist * Math.sin(st.pitch)];
+    st._eye = eye;   // the billboards turn toward it
     const tgt = [st.target[0], st.target[1], st.target[2] * st.exag];
     const mvp = mul(perspective(0.9, w / Math.max(1, h), Math.max(0.5, Math.min(20, st.dist * 0.03)), 200000), lookAt(eye, tgt, [0, 0, 1])); st.lastMvp = mvp;
     const SUN = L.dir, FOG = 1 / Math.max(70000, st.dist * 3);
@@ -4510,7 +5216,7 @@ function createView3D(host, deps) {
         const L = new Float32Array(8).fill(-1); m.slots.forEach((id, i) => { const l = st.arrLayers.get(id); if (l != null) L[i] = l; });
         gl.uniform1fv(P.loc.uL, L);
       }
-      gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+      drawTer(m);
     }
     for (const k of ['aPos', 'aNor', 'aCol', 'aVc', 'aW0', 'aW1']) if (P.loc[k] != null && P.loc[k] >= 0) gl.disableVertexAttribArray(P.loc[k]);
     // structures: two-sided, real textures, see-through leaves
@@ -4538,7 +5244,7 @@ function createView3D(host, deps) {
       drawGrassTrees();
       for (const k of ['aPos', 'aNor', 'aUv', 'aShade']) gl.disableVertexAttribArray(STR.loc[k]);
     }
-    // the surrounding cells (not loaded yet): see-through preview
+    // the surrounding cells (objects not loaded): solid ground in its real colours, so valleys and rivers go on to the horizon
     if (st.ringMeshes.length) {
       gl.useProgram(TER.p);
       gl.uniformMatrix4fv(TER.loc.uMVP, false, mvp); gl.uniform1f(TER.loc.uExag, st.exag);
@@ -4546,12 +5252,12 @@ function createView3D(host, deps) {
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.enable(gl.CULL_FACE);
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
       for (const m of st.ringMeshes) {
-        gl.uniform1f(TER.loc.uAlpha, st.hover === m.c ? 0.85 : 0.32);
+        gl.uniform1f(TER.loc.uAlpha, 1);
         gl.bindBuffer(gl.ARRAY_BUFFER, m.vbo);
         gl.enableVertexAttribArray(TER.loc.aPos); gl.vertexAttribPointer(TER.loc.aPos, 3, gl.FLOAT, false, 80, 0);
         gl.enableVertexAttribArray(TER.loc.aNor); gl.vertexAttribPointer(TER.loc.aNor, 3, gl.FLOAT, false, 80, 12);
         gl.enableVertexAttribArray(TER.loc.aCol); gl.vertexAttribPointer(TER.loc.aCol, 3, gl.FLOAT, false, 80, 24);
-        gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+        drawTer(m);
       }
       for (const k of ['aPos', 'aNor', 'aCol']) gl.disableVertexAttribArray(TER.loc[k]);
       gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
@@ -4569,6 +5275,7 @@ function createView3D(host, deps) {
     };
     gl.depthMask(false);
     if (st.structs !== false && st.missBuf && st.missBuf.n) drawFlat(st.missBuf, gl.TRIANGLES);
+    if (st.water && st.pwBuf && st.pwBuf.n) drawFlat(st.pwBuf, gl.TRIANGLES);
     drawFlat(st.flat.tris, gl.TRIANGLES);
     drawFlat(st.flat.lines, gl.LINES);
     if (st.navOn && st.navTris) { drawFlat(st.navTris, gl.TRIANGLES); drawFlat(st.navLines, gl.LINES); gl.disable(gl.DEPTH_TEST); drawFlat(st.navBadT, gl.TRIANGLES); drawFlat(st.navBadL, gl.LINES); gl.enable(gl.DEPTH_TEST); }
@@ -4577,11 +5284,91 @@ function createView3D(host, deps) {
     if (st.selBuf && st.selBuf.n && st.grid !== false) { gl.disable(gl.DEPTH_TEST); drawFlat(st.selBuf, gl.LINES); gl.enable(gl.DEPTH_TEST); }
     if (st.hoverBuf && st.hoverBuf.n && st.grid !== false) { gl.disable(gl.DEPTH_TEST); drawFlat(st.hoverBuf, gl.LINES); gl.enable(gl.DEPTH_TEST); }
     gl.disableVertexAttribArray(FLAT.loc.aPos); gl.disableVertexAttribArray(FLAT.loc.aCol);
+    if (st.fx !== false && st.structs !== false) drawEffects(mvp, h * dpr);
     gl.depthMask(true); gl.disable(gl.BLEND);
     if (look) runPost(look);
     placeLabels(mvp, w, h);
   }
   requestAnimationFrame(frame);
+  /* Effects: flowing surfaces, then particles moved for this moment. While any are in view the picture is redrawn every frame. */
+  const BF = [gl.ONE, gl.ZERO, gl.SRC_COLOR, gl.ONE_MINUS_SRC_COLOR, gl.DST_COLOR, gl.ONE_MINUS_DST_COLOR, gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.DST_ALPHA, gl.ONE_MINUS_DST_ALPHA, gl.SRC_ALPHA_SATURATE];
+  const fxBlend = b => gl.blendFunc(BF[b[0]] != null ? BF[b[0]] : gl.SRC_ALPHA, BF[b[1]] != null ? BF[b[1]] : gl.ONE_MINUS_SRC_ALPHA);
+  const rnd = (i, k) => { const x = Math.sin(i * 127.1 + k * 311.7) * 43758.5453; return x - Math.floor(x); };   // fixed "random" per particle
+  function drawEffects(mvp, hPx) {
+    const t = st.fxStill ? 0 : performance.now() / 1000, any = (st.fxBatches && st.fxBatches.length) || (st.fxEmit && st.fxEmit.length);
+    if (!any) return;
+    gl.enable(gl.BLEND); gl.depthMask(false);
+    if (st.fxBatches.length) {
+      gl.useProgram(FXS.p); gl.uniformMatrix4fv(FXS.loc.uMVP, false, mvp); gl.uniform1f(FXS.loc.uExag, st.exag); gl.uniform1i(FXS.loc.uTex, 0); gl.activeTexture(gl.TEXTURE0);
+      const ey = st._eye || [0, 0, 0]; gl.uniform3f(FXS.loc.uCam, ey[0], ey[1], ey[2] / (st.exag || 1));
+      for (const b of st.fxBatches) {
+        const e = texFor(b.tex), ok = e && e.t;
+        if (b.tex && e && !e.ready) continue;              // its texture is still loading (one that can't be read is drawn plain)
+        gl.bindTexture(gl.TEXTURE_2D, ok ? e.t.tex : null); gl.uniform1f(FXS.loc.uHasTex, ok ? 1 : 0);
+        { const pe = b.pal ? texFor(b.pal) : null, pok = pe && pe.t; gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, pok ? pe.t.tex : null); gl.uniform1i(FXS.loc.uPal, 1); gl.uniform1f(FXS.loc.uHasPal, pok ? 1 : 0); gl.activeTexture(gl.TEXTURE0); }
+        gl.uniform4fv(FXS.loc.uCol, b.col); gl.uniform2f(FXS.loc.uOff, (b.uv[0] * t) % 1, (b.uv[1] * t) % 1); fxBlend(b.blend);
+        gl.bindBuffer(gl.ARRAY_BUFFER, b.b);
+        gl.enableVertexAttribArray(FXS.loc.aPos); gl.vertexAttribPointer(FXS.loc.aPos, 3, gl.FLOAT, false, 40, 0);
+        gl.enableVertexAttribArray(FXS.loc.aUv); gl.vertexAttribPointer(FXS.loc.aUv, 2, gl.FLOAT, false, 40, 12);
+        gl.enableVertexAttribArray(FXS.loc.aA); gl.vertexAttribPointer(FXS.loc.aA, 1, gl.FLOAT, false, 40, 20);
+        gl.enableVertexAttribArray(FXS.loc.aBB); gl.vertexAttribPointer(FXS.loc.aBB, 3, gl.FLOAT, false, 40, 24);
+        gl.enableVertexAttribArray(FXS.loc.aMode); gl.vertexAttribPointer(FXS.loc.aMode, 1, gl.FLOAT, false, 40, 36);
+        gl.drawArrays(gl.TRIANGLES, 0, b.n);
+      }
+      for (const k of ['aPos', 'aUv', 'aA', 'aBB', 'aMode']) gl.disableVertexAttribArray(FXS.loc[k]);
+    }
+    if (st.fxEmit.length) {
+      gl.useProgram(FXP.p); gl.uniformMatrix4fv(FXP.loc.uMVP, false, mvp); gl.uniform1f(FXP.loc.uExag, st.exag); gl.uniform1i(FXP.loc.uTex, 0); gl.activeTexture(gl.TEXTURE0);
+      gl.uniform1f(FXP.loc.uPx, hPx / (2 * Math.tan(0.45)));
+      if (!st.fxBuf) st.fxBuf = gl.createBuffer();
+      const O = st.origin;
+      for (let ei = 0; ei < st.fxEmit.length; ei++) {
+        const e = st.fxEmit[ei], tx = texFor(e.tex), ok = tx && tx.t; if (e.tex && tx && !tx.ready) continue;
+        const data = new Float32Array(e.n * 14);
+        for (let i = 0; i < e.n; i++) {
+          const life = e.life * (1 + e.lv * (rnd(i, 1) * 2 - 1) / Math.max(e.life, 0.01)), age = ((t + i * e.life / e.n + rnd(i, 9) * e.life) % life + life) % life, f = age / life;
+          const bx = (rnd(i, 2) - 0.5) * e.box[0], by = (rnd(i, 3) - 0.5) * e.box[1], bz = (rnd(i, 4) - 0.5) * e.box[2];
+          const th = e.decl + e.dv * (rnd(i, 5) * 2 - 1), ph = e.planar + e.pv * (rnd(i, 6) * 2 - 1), sp = (e.speed + e.sv * (rnd(i, 7) * 2 - 1)) * e.k;
+          const d = [Math.sin(th) * Math.cos(ph), Math.sin(th) * Math.sin(ph), Math.cos(th)], R = e.R;
+          // where it has travelled: its speed slowed by drag along each drag direction, gravity on top
+          const vel = [0, 1, 2].map(k => (R[k * 3] * d[0] + R[k * 3 + 1] * d[1] + R[k * 3 + 2] * d[2]) * sp);
+          const disp = vel.map(q => q * age); let kAvg = 0;
+          for (const dg of e.dragW || []) { const vd = vel[0] * dg.a[0] + vel[1] * dg.a[1] + vel[2] * dg.a[2], tr = dg.k > 1e-4 ? (1 - Math.exp(-dg.k * age)) / dg.k : age; for (let k = 0; k < 3; k++) disp[k] += vd * (tr - age) * dg.a[k]; kAvg += dg.k / e.dragW.length; }
+          const gt = kAvg > 1e-4 ? age / kAvg - (1 - Math.exp(-kAvg * age)) / (kAvg * kAvg) : 0.5 * age * age;
+          const p = [0, 1, 2].map(k => e.o[k] + R[k * 3] * bx + R[k * 3 + 1] * by + R[k * 3 + 2] * bz + disp[k] + e.g[k] * gt - O[k]);
+          // size over life from the model's own curve; colour and opacity from its three colours; fades at both ends
+          const sc = e.scaleCurve ? (() => { const q = f * (e.scaleCurve.length - 1), j = Math.floor(q), w = q - j; return e.scaleCurve[j] * (1 - w) + (e.scaleCurve[Math.min(j + 1, e.scaleCurve.length - 1)]) * w; })() : (1 + ((e.grow || 1) - 1) * f);
+          const size = e.radius * (1 + e.rv * (rnd(i, 8) * 2 - 1) / Math.max(e.radius, 0.01)) * 2 * sc;
+          let col = [1, 1, 1, e.peak != null ? e.peak : 1];
+          if (e.colKeys) { const [A, B, C, D] = e.colKeys.pc, [c1, c2, c3] = e.colKeys.cols, L = (x, y, w) => x.map((q, k) => q + (y[k] - q) * Math.max(0, Math.min(1, w)));
+            col = f <= A ? c1 : f <= B ? L(c1, c2, (f - A) / Math.max(B - A, 1e-4)) : f <= C ? c2 : L(c2, c3, (f - C) / Math.max(D - C, 1e-4)); }
+          const a = col[3] * Math.min(1, f / (e.fadeIn || 0.12)) * Math.min(1, (1 - f) / (e.fadeOut || 0.35));
+          const rot = e.spin ? (e.spin.a0 + e.spin.av * (rnd(i, 11) * 2 - 1)) + (e.spin.speed + e.spin.sv * (rnd(i, 12) * 2 - 1)) * (e.spin.sign && rnd(i, 13) < 0.5 ? -1 : 1) * age : 0;
+          // the part of the sheet: the next frame as the particle ages (animated sheets), or one fixed part per particle
+          const fr = Math.min(e.frames - 1, Math.floor(f * e.frames)), rc = e.rects ? (e.frames > 1 ? e.rects[Math.min(fr, e.rects.length - 1)] : e.rects[Math.floor(rnd(i, 10) * e.rects.length)]) : null;
+          data.set([p[0], p[1], p[2], size, a, Math.min(e.frames - 1, Math.floor(f * e.frames)), rc ? rc[0] : 0, rc ? rc[1] : 0, rc ? rc[2] : 0, rc ? rc[3] : 0, rot, col[0], col[1], col[2]], i * 14);
+        }
+        gl.bindTexture(gl.TEXTURE_2D, ok ? tx.t.tex : null); gl.uniform1f(FXP.loc.uHasTex, ok ? 1 : 0);
+        { const pe = e.pal ? texFor(e.pal) : null, pok = pe && pe.t; gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, pok ? pe.t.tex : null); gl.uniform1i(FXP.loc.uPal, 1); gl.uniform1f(FXP.loc.uHasPal, pok ? 1 : 0); gl.activeTexture(gl.TEXTURE0); }
+        const mu = Math.min(e.mult, 1.25), addv = e.blend && e.blend[1] === 0;   // no blow-out to white; added light and mist count for less
+        gl.uniform4f(FXP.loc.uCol, e.color[0] * e.emis[0] * mu, e.color[1] * e.emis[1] * mu, e.color[2] * e.emis[2] * mu, e.color[3] * e.emis[3] * (addv ? 0.35 : (e.colKeys ? 1 : 0.6)));   // the model's own opacity curve when it has one
+        gl.uniform1f(FXP.loc.uGrid, e.grid || 1); fxBlend(e.blend);
+        gl.bindBuffer(gl.ARRAY_BUFFER, st.fxBuf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STREAM_DRAW);
+        const S = 56;
+        gl.enableVertexAttribArray(FXP.loc.aPos); gl.vertexAttribPointer(FXP.loc.aPos, 3, gl.FLOAT, false, S, 0);
+        gl.enableVertexAttribArray(FXP.loc.aSize); gl.vertexAttribPointer(FXP.loc.aSize, 1, gl.FLOAT, false, S, 12);
+        gl.enableVertexAttribArray(FXP.loc.aA); gl.vertexAttribPointer(FXP.loc.aA, 1, gl.FLOAT, false, S, 16);
+        gl.enableVertexAttribArray(FXP.loc.aF); gl.vertexAttribPointer(FXP.loc.aF, 1, gl.FLOAT, false, S, 20);
+        gl.enableVertexAttribArray(FXP.loc.aRect); gl.vertexAttribPointer(FXP.loc.aRect, 4, gl.FLOAT, false, S, 24);
+        gl.enableVertexAttribArray(FXP.loc.aRot); gl.vertexAttribPointer(FXP.loc.aRot, 1, gl.FLOAT, false, S, 40);
+        gl.enableVertexAttribArray(FXP.loc.aPc); gl.vertexAttribPointer(FXP.loc.aPc, 3, gl.FLOAT, false, S, 44);
+        gl.drawArrays(gl.POINTS, 0, e.n);
+      }
+      for (const k of ['aPos', 'aSize', 'aA', 'aF', 'aRect', 'aRot', 'aPc']) gl.disableVertexAttribArray(FXP.loc[k]);
+    }
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    if (!st.fxStill) st.dirty = true;   // keep it moving
+  }
   function placeCellLabels(mvp, w, h) {
     const box = q('.v3-cells');
     const want = st.cells;
@@ -4736,7 +5523,9 @@ function createView3D(host, deps) {
   function computeRing() {
     const have = new Set(st.cells.map(n => n.x + ',' + n.y)), seen = new Set();
     st.ring = [];
-    for (const n of st.cells) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    // the ground (and water) around the loaded cells, so the view doesn't end in a cliff where a river or valley goes on
+    const R = ({ normal: 3, high: 4, ultra: 5 })[st.quality] || 3;
+    for (const n of st.cells) for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
       const k = (n.x + dx) + ',' + (n.y + dy); if (have.has(k) || seen.has(k)) continue; seen.add(k);
       const m = W().cells.get(W().coordKey(n.x + dx, n.y + dy)); if (m && m.winner && (!deps.canLoad || deps.canLoad(m))) st.ring.push(m);
     }
@@ -4818,10 +5607,10 @@ function createView3D(host, deps) {
     ['🛠 Create patch', `<p>${K('🛠 Create patch')} downloads a small plugin that closes the seams. At each border, the ground and its textures are blended so both sides meet.</p>
       <ul><li>It contains only the ground of the cells it fixes. Your mods and load order are not touched.</li><li><b>Install it like any mod</b>, enable it, and place it after the plugin named in the message. It is ESL-flagged, so it uses no plugin slot.</li><li>To also fix a small or vanilla gap, tick its ${K('🛠')} box in the <b>⚠ Warnings</b> tab first.</li><li>Make a new patch whenever your load order changes. Removing the plugin undoes everything.</li></ul>`],
     ['⛏ Terraform', `<p>Reshape the ground yourself, for example where terrain pokes through a building's floor.</p>
-      <ul><li>Click ${K('⛏ Terraform')}, choose ${K('▼ Lower')} or ${K('▲ Raise')}, then set the brush size and the depth per click.</li><li><b>Click the ground</b> to apply. Click again to go further.</li><li>${K('🧽 Remove texture')}: click the texture to take away (snow, for example), then click over it: what lies under it takes its place. ${K('🖌 Paint texture')} works the same way to paint one. Cell borders stay matched.</li><li>Neighbouring cells follow automatically, so you can't create a seam.</li><li>${K('↶ Undo')} takes back the last click. ${K('🛠 Create patch')} saves your edits in the same patch as the seam fixes.</li></ul>
+      <ul><li>Click ${K('⛏ Terraform')}, choose ${K('▼ Lower')} or ${K('▲ Raise')}, then set the brush size and the depth per click.</li><li><b>Click the ground</b> to apply. Click again to go further.</li><li>Next to it, ${K('🖌 Paint textures')}: ${K('🧽 Remove texture')} takes a ground texture away (click the texture, for example snow, then click over it: what lies under it takes its place); ${K('🖌 Paint texture')} paints one the same way. Cell borders stay matched.</li><li>Neighbouring cells follow automatically, so you can't create a seam.</li><li>${K('↶ Undo')} takes back the last click. ${K('🛠 Create patch')} saves your edits in the same patch as the seam fixes.</li></ul>
       <p class="muted">Objects and NPC paths are not moved with the ground.</p>`],
     ['🔍 Identify / disable an object', `<p>Find out what something is, and remove it if you don't want it.</p>
-      <ul><li>Click ${K('🔍 Identify / disable object')}, then click a building, rock, tree or any object.</li><li>A box shows its name, its model file and <b>which mod placed it</b>.</li><li>${K('🚫 Disable this object')} removes it from the view. ${K('⬇ Drop to ground')} puts a floating object back on the ground (▲ ▼ nudge it). Repeat for as many objects as you like.</li><li>A counter appears at the top with ${K('🛠 Create patch')}: it downloads a plugin that switches those objects off in game, the same way as doing it by hand in xEdit.</li></ul>
+      <ul><li>Click ${K('🔍 Identify / disable / move object')}, then click a building, rock, tree or any object.</li><li>A box shows its name, its model file and <b>which mod placed it</b>.</li><li>${K('🚫 Disable this object')} removes it from the view. ${K('⬇ Drop to ground')} puts a floating object back on the ground (▲ ▼ nudge it). Repeat for as many objects as you like.</li><li>A counter appears at the top with ${K('🛠 Create patch')}: it downloads a plugin that switches those objects off in game, the same way as doing it by hand in xEdit.</li></ul>
       <p class="muted">Pink boxes are objects whose model file couldn't be found.</p>`],
     ['🌿 Identify grass', `<p>Track down wrong or purple grass.</p>
       <ul><li>Click ${K('🌿 Identify grass')}, then click the ground.</li><li>The panel lists the ground textures at that spot, the grass each one grows, and the mod that decides each.</li><li>Every model and texture file is marked <b>found</b> or <b>MISSING</b>. A missing texture is what turns grass purple in game.</li></ul>`],
@@ -5007,7 +5796,7 @@ function createView3D(host, deps) {
     // the ground hides what is behind it (number 0)
     off('aUv'); off('aShade'); off('aId'); gl.vertexAttrib2f(L.aUv, 0, 0); gl.vertexAttrib1f(L.aShade, 127); gl.vertexAttrib1f(L.aId, 0); gl.uniform1f(L.uAlpha, 0);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
-    for (const m of st.meshes) { gl.bindBuffer(gl.ARRAY_BUFFER, m.vbo); gl.enableVertexAttribArray(L.aPos); gl.vertexAttribPointer(L.aPos, 3, gl.FLOAT, false, 80, 0); gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0); }
+    for (const m of st.meshes) { gl.bindBuffer(gl.ARRAY_BUFFER, m.vbo); gl.enableVertexAttribArray(L.aPos); gl.vertexAttribPointer(L.aPos, 3, gl.FLOAT, false, 80, 0); drawTer(m); }
     if (st.structs !== false) for (const b of st.sBatches) {
       if (!b.idbo) continue;
       const e = texFor(b.tex), t = e && e.t;
@@ -5044,7 +5833,8 @@ function createView3D(host, deps) {
     return id > 0 ? (st.objs || [])[id - 1] || null : null;
   }
   function pickObject(mx, my) {
-    if (!st._cpuPick) { try { const g = pickGPU(mx, my); if (g !== undefined) return g; } catch (e) { console.warn('GPU pick', e); } }
+    // nothing solid under the cursor: effects (smoke, steam, waterfalls) are not in the GPU pass, so the slower test looks for them
+    if (!st._cpuPick) { try { const g = pickGPU(mx, my); if (g) return g; } catch (e) { console.warn('GPU pick', e); } }
     return pickCPU(mx, my);
   }
   function pickCPU(mx, my) {
@@ -5067,9 +5857,9 @@ function createView3D(host, deps) {
       }
       if (tn > tf || tf < 0 || (tn >= bt && tn >= btA)) continue;
       let hit = Infinity, hitA = Infinity;
-      if (!ob.m.shapes.length) hit = Math.max(tn, 0);            // no model to test: its box
+      if (!ob.m.shapes.length) { if (ob.bi.fx || (ob.m.particles && ob.m.particles.length)) hitA = Math.max(tn, 0); else hit = Math.max(tn, 0); }   // no model to test: its box (an effect's box only when nothing solid is there)
       else for (const sh of ob.m.shapes) {
-        const P = sh.pos, I = sh.idx, see = !!sh.alpha;
+        const P = sh.pos, I = sh.idx, see = !!sh.alpha || !!sh.fx || !!sh.water;   // see-through, effects and water: only when nothing solid is under the cursor
         for (let t = 0; t + 2 < I.length; t += 3) {              // Möller–Trumbore, both faces
           const a = I[t] * 3, b = I[t + 1] * 3, c = I[t + 2] * 3;
           const e1x = P[b] - P[a], e1y = P[b + 1] - P[a + 1], e1z = P[b + 2] - P[a + 2], e2x = P[c] - P[a], e2y = P[c + 1] - P[a + 1], e2z = P[c + 2] - P[a + 2];
@@ -5104,11 +5894,26 @@ function createView3D(host, deps) {
       + (r.p != null ? `Placed by: ${esc(P(r.p))}` : 'Part of a static collection') + (r.key != null ? ` · ref ${hex(r.key)}` : '')
       + (ob.m.missing ? `<br><span class="muted">${ob.m.missing === 'missing' ? 'Shown as a pink box. The game has no model to show here either: the mod that placed it expects a file you do not have, usually from a requirement that is not installed.' : 'Shown as a pink box: the model exists, the tool just cannot draw it. It looks normal in game.'}</span>` : '')
       + (ob.m.missing ? '' : `<br><span class="muted">${ob.m.shapes.length} part(s) · ${ob.m.shapes.filter(x => x.alpha).length} see-through · textures: ${esc([...new Set(ob.m.shapes.map(x => x.tex || '—'))].slice(0, 3).join(', '))}</span>`);
+    // effects on it or just above it (chimney smoke, a fire's flames, steam): switched off with it, or they stay floating in game
+    const fxNear = (() => {
+      if (bi.fx || !st.objs) return [];
+      const M = TSIAssets.refMatrix(r), A = M.m, t0 = [r.x, r.y, r.z], lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+      for (const x of [ob.m.min[0], ob.m.max[0]]) for (const y of [ob.m.min[1], ob.m.max[1]]) for (const z of [ob.m.min[2], ob.m.max[2]]) {
+        const p = [t0[0] + A[0] * x + A[1] * y + A[2] * z, t0[1] + A[3] * x + A[4] * y + A[5] * z, t0[2] + A[6] * x + A[7] * y + A[8] * z];
+        for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); }
+      }
+      const pad = 150, hidden = deps.hiddenRefs ? deps.hiddenRefs() : new Set();
+      return st.objs.filter(o => o !== ob && o.bi.fx && o.r.key != null && o.r.off != null && !hidden.has(o.r.key) &&
+        o.r.x >= lo[0] - pad && o.r.x <= hi[0] + pad && o.r.y >= lo[1] - pad && o.r.y <= hi[1] + pad && o.r.z >= lo[2] - pad && o.r.z <= hi[2] + 600);
+    })();
     if (r.key != null && r.off != null && deps.hideRef) {
-      tip.innerHTML += `<br><button class="small v3-hide" style="margin-top:5px;pointer-events:auto">🚫 Disable this object</button>`
+      tip.innerHTML += (fxNear.length ? `<br><span style="color:#ffb84d">Effects on it: ${esc(fxNear.map(o => o.bi.edid || o.bi.model).slice(0, 4).join(', '))}${fxNear.length > 4 ? '…' : ''}</span><br><button class="small v3-hidefx" style="margin-top:5px;pointer-events:auto">🚫 Disable it with its effects (${fxNear.length + 1})</button> ` : '<br>')
+        + `<button class="small v3-hide" style="margin-top:5px;pointer-events:auto">🚫 Disable ${fxNear.length ? 'only this object' : 'this object'}</button>`
         + (deps.moveRef ? `<div style="margin-top:5px;pointer-events:auto;display:flex;gap:4px;align-items:center;flex-wrap:wrap"><button class="small v3-drop" title="Lowers (or raises) it until its lowest point touches the ground under it">⬇ Drop to ground</button><span class="muted" style="font-size:11.5px">or nudge</span><button class="small" data-nz="1" title="Up">▲</button><button class="small" data-nz="-1" title="Down">▼</button><select class="v3-nstep" title="Nudge step">${[4, 16, 64].map(v => `<option value="${v}" ${v === st.nudge ? 'selected' : ''}>${v} u</option>`).join('')}</select></div><div class="v3-movemsg muted" style="font-size:11.5px"></div>` : '');
       const orig = r._orig || r, name = bi.edid || bi.model || 'object', done = () => { tip.style.display = 'none'; if (st.selObj) { gl.deleteBuffer(st.selObj.b); st.selObj = null; } refreshHidden(); };
       tip.querySelector('.v3-hide').onclick = e => { e.stopPropagation(); deps.hideRef(orig, name); done(); };
+      const hfx = tip.querySelector('.v3-hidefx');
+      if (hfx) hfx.onclick = e => { e.stopPropagation(); deps.hideRef(orig, name); for (const o of fxNear) deps.hideRef(o.r._orig || o.r, o.bi.edid || o.bi.model || 'effect'); done(); };
       if (deps.moveRef) {
         tip.querySelector('.v3-nstep').onchange = e => { st.nudge = Number(e.target.value); };
         tip.querySelector('.v3-nstep').onclick = e => e.stopPropagation();
@@ -5152,8 +5957,8 @@ function createView3D(host, deps) {
     const el = q('.v3-terra'), t = st.terra;
     el.style.display = t.on ? 'block' : 'none'; if (!t.on) return;
     const brush = t.dir === 'erase' || t.dir === 'paint';
-    el.innerHTML = `<b>⛏ Terraform</b> <span class="muted">click the ground</span>
-      <div class="row" style="margin:6px 0;flex-wrap:wrap;gap:4px"><button class="small ${t.dir === -1 ? 'on' : ''}" data-td="-1">▼ Lower</button><button class="small ${t.dir === 1 ? 'on' : ''}" data-td="1">▲ Raise</button><button class="small ${t.dir === 'erase' ? 'on' : ''}" data-td="erase" title="Take a ground texture away (snow, for example): what lies under it takes its place.">🧽 Remove texture</button><button class="small ${t.dir === 'paint' ? 'on' : ''}" data-td="paint" title="Paint a ground texture taken from somewhere else on the ground.">🖌 Paint texture</button></div>
+    el.innerHTML = `<b>${brush ? '🖌 Paint textures' : '⛏ Terraform'}</b> <span class="muted">click the ground</span>
+      <div class="row" style="margin:6px 0;flex-wrap:wrap;gap:4px">${brush ? '' : `<button class="small ${t.dir === -1 ? 'on' : ''}" data-td="-1">▼ Lower</button><button class="small ${t.dir === 1 ? 'on' : ''}" data-td="1">▲ Raise</button>`}${brush ? `<button class="small ${t.dir === 'erase' ? 'on' : ''}" data-td="erase" title="Take a ground texture away (snow, for example): what lies under it takes its place.">🧽 Remove texture</button><button class="small ${t.dir === 'paint' ? 'on' : ''}" data-td="paint" title="Paint a ground texture taken from somewhere else on the ground.">🖌 Paint texture</button>` : ''}</div>
       ${brush ? `<div style="margin:2px 0 6px;font-size:12.5px">${t.picking || !t.tex ? `<b style="color:#ffb84d">Click the ground on the texture you want to ${t.dir === 'erase' ? 'remove' : 'paint with'}.</b>` : `${t.dir === 'erase' ? 'Removing' : 'Painting'}: <b>${esc(t.tex.name)}</b> <button class="small" data-pick>Pick another</button>`}</div>` : ''}
       <label>Brush size <b>${t.size * 128}</b> u<input type="range" min="1" max="10" value="${t.size}" data-tk="size"></label>
       ${brush ? `<label>Strength per click <b>${Math.round(t.amt * 100)}</b>%<input type="range" min="10" max="100" step="5" value="${Math.round(t.amt * 100)}" data-tk="amt"></label>
@@ -5161,7 +5966,7 @@ function createView3D(host, deps) {
       `<label>Depth per click <b>${t.power}</b> u<input type="range" min="8" max="256" step="8" value="${t.power}" data-tk="power"></label>
       <div class="muted" style="font-size:11.5px;margin-top:4px">Objects and navmesh are not moved. A person is about 128 u tall.</div>`}`;
     const pk = el.querySelector('[data-pick]'); if (pk) pk.onclick = () => { t.picking = true; terraPanel(); };
-    el.querySelectorAll('[data-td]').forEach(b => b.onclick = () => { const v = b.dataset.td; t.dir = v === 'erase' || v === 'paint' ? v : Number(v); if (t.dir === 'erase' || t.dir === 'paint') t.picking = true; terraPanel(); });
+    el.querySelectorAll('[data-td]').forEach(b => b.onclick = () => { const v = b.dataset.td; t.dir = v === 'erase' || v === 'paint' ? v : Number(v); if (t.dir === 'erase' || t.dir === 'paint') { t.picking = true; t.lastTex = t.dir; } else t.lastGround = t.dir; terraPanel(); });
     el.querySelectorAll('[data-tk]').forEach(r => r.oninput = () => { const k = r.dataset.tk; t[k] = k === 'amt' ? Number(r.value) / 100 : Number(r.value); r.previousElementSibling.textContent = k === 'size' ? t.size * 128 : k === 'amt' ? Math.round(t.amt * 100) : t.power; });
   }
   function terraBar() {
@@ -5223,12 +6028,23 @@ function createView3D(host, deps) {
     if (res && res.ok === false) { const tip = q('.v3-tip'); tip.style.display = 'block'; tip.style.left = mx + 14 + 'px'; tip.style.top = my + 14 + 'px'; tip.innerHTML = 'Too steep here: the game can\'t store a step of more than about 1000 units between two points. Use a bigger brush or less depth.'; return; }
     terraShow(res);
   }
-  q('.v3-terrab').onclick = () => {
-    if (deps.canTerraform && !deps.canTerraform()) { const pan = q('.v3-gpanel'); pan.style.display = 'block'; pan.innerHTML = closeBtn + 'Terraforming works in the outside view of a worldspace. Use "go outside" first.'; wireClose(); return; }
-    st.terra.on = !st.terra.on; q('.v3-terrab').classList.toggle('on', st.terra.on);
-    if (st.terra.on) { if (st.identify) q('.v3-ident').onclick(); if (st.grassPick) q('.v3-grassb').onclick(); }
-    canvas.style.cursor = st.terra.on ? 'crosshair' : 'grab'; terraPanel(); terraBar();
-  };
+  // ⛏ Terraform and 🖌 Paint textures share one brush panel: kind 'ground' (lower / raise) or 'tex' (remove / paint); null switches it off
+  function terraToggle(kind) {
+    const t = st.terra, cur = t.on ? (t.dir === 'erase' || t.dir === 'paint' ? 'tex' : 'ground') : null;
+    if (kind && deps.canTerraform && !deps.canTerraform()) { const pan = q('.v3-gpanel'); pan.style.display = 'block'; pan.innerHTML = closeBtn + 'Terraforming and painting work in the outside view of a worldspace. Use "go outside" first.'; wireClose(); return; }
+    if (!kind || kind === cur) t.on = false;
+    else {
+      t.on = true;
+      if (kind === 'tex' && cur !== 'tex') { t.dir = t.lastTex || 'erase'; t.picking = !t.tex; }
+      if (kind === 'ground' && cur !== 'ground') t.dir = t.lastGround || -1;
+      if (st.identify) q('.v3-ident').onclick(); if (st.grassPick) q('.v3-grassb').onclick();
+    }
+    const now = t.on ? (t.dir === 'erase' || t.dir === 'paint' ? 'tex' : 'ground') : null;
+    q('.v3-terrab').classList.toggle('on', now === 'ground'); q('.v3-texb').classList.toggle('on', now === 'tex');
+    canvas.style.cursor = t.on ? 'crosshair' : 'grab'; terraPanel(); terraBar();
+  }
+  q('.v3-terrab').onclick = () => terraToggle('ground');
+  q('.v3-texb').onclick = () => terraToggle('tex');
   /* Objects you switched off: gone from the view at once; "Create patch" makes it real in game. */
   function refreshHidden(rebuild = true) {
     const bar = q('.v3-hidbar'), n = deps.hiddenRefs ? deps.hiddenRefs().size : 0, nm = deps.movedRefs ? [...deps.movedRefs().keys()].filter(k => !deps.hiddenRefs().has(k)).length : 0;
@@ -5261,13 +6077,25 @@ function createView3D(host, deps) {
     const tpath = t => { let x = t.replace(/\//g, '\\').replace(/^\\+/, '').replace(/^data\\/i, ''); return /^textures\\/i.test(x) ? x : 'textures\\' + x; };
     const mpath = m => { let x = m.replace(/\//g, '\\').replace(/^\\+/, '').replace(/^data\\/i, ''); return /^meshes\\/i.test(x) ? x : 'meshes\\' + x; };
     let html = `<b>Grass at cell ${cx}, ${cy}</b>` + closeBtn + `<div class="muted" style="margin:2px 0 6px">Ground painted by <b>${E(P(v.p))}</b>. The game grows grass from the ground textures below; a texture file it can't find shows purple.</div>`;
+    if (d.layersAll && d.layersAll[qd] && d.layersAll[qd].length > d.layers[qd].length) {
+      const gone = d.layersAll[qd].filter(L => !d.layers[qd].includes(L)).map(L => E(TSI.texName(C, L.tex)));
+      html += `<div style="color:#ff9d5c;margin:0 0 6px"><b>This quarter of the cell holds more than 6 textures.</b> The game draws only 6, so it leaves out: ${gone.join(', ')}. The view shows it the way the game does. Fix it from ⚠ Warnings → Too many textures.</div>`;
+    }
     let problems = 0, badTex = 0;
     if (!here.length) html += '<div>No ground texture at this spot.</div>';
     for (const h of here) {
       const lt = h.t >= 0 ? C.ltex.get(h.t) : null;
       html += `<div class="g-tex"><b>${E(TSI.texName(C, h.t))}</b> <span class="muted">${Math.round(h.w * 100)}% here</span>`;
-      if (h.t < 0) { html += '<div class="muted">Default ground: grows no grass.</div></div>'; continue; }
+      if (h.t < 0) { const df = 'textures\\landscape\\dirt02.dds', ds = await A.source(df); html += `<div class="muted">No texture set on this quarter of the cell: the game shows its standard ground here.</div><div class="mono">Ground image: ${E(df)} — ${ds ? ok + ' <span class="muted">(' + E(ds) + ')</span>' : bad}</div><div class="muted">Grows no grass.</div></div>`; continue; }
       if (!lt) { html += `<div style="color:#ff6b6b">This ground texture's record isn't in your load order.</div></div>`; problems++; continue; }
+      // the ground image itself: which file, from where, and whether the 3D view can draw it
+      { const ck = TSI.texCompareKey(C, h.t), file = /\.dds$/i.test(ck) ? tpath(ck) : null;
+        if (!file) html += `<div style="color:#ffb84d">Ground image: none set in its texture set (the view guesses a colour)</div>`;
+        else {
+          const src = await A.source(file), td = src ? await A.textureData(file, 64) : null;
+          const canDraw = td && (td.fmt !== 'bc7' || !!bptc);
+          html += `<div class="mono">Ground image: ${E(file)} — ${src ? ok + ' <span class="muted">(' + E(src) + ')</span>' : bad}${src && !td ? ' <b style="color:#ffb84d">unreadable format</b>' : ''}${td && !canDraw ? ' <b style="color:#ffb84d">BC7: this browser can\'t draw it</b>' : ''}${td ? ` <span class="muted">${td.fmt.toUpperCase()}</span>` : ''}</div>`;
+        } }
       const srcs = lt.src || [];
       html += `<div class="muted">Grass list from <b>${E(P(srcs[srcs.length - 1]))}</b>` + (srcs.length > 1 ? ` (also edited by ${srcs.slice(0, -1).reverse().map(x => E(P(x))).join(', ')})` : '') + '</div>';
       if (!lt.grass.length) { html += '<div class="muted">No grass on this texture.</div></div>'; continue; }
@@ -5299,13 +6127,13 @@ function createView3D(host, deps) {
   const closeBtn = '<button class="small g-x" style="float:right;margin-left:8px">✕</button>';
   function wireClose() { const b = q('.v3-gpanel .g-x'); if (b) b.onclick = () => { q('.v3-gpanel').style.display = 'none'; }; }
   q('.v3-grassb').onclick = () => {
-    if (!st.grassPick && st.terra.on) q('.v3-terrab').onclick();
+    if (!st.grassPick && st.terra.on) terraToggle(null);
     st.grassPick = !st.grassPick; q('.v3-grassb').classList.toggle('on', st.grassPick);
     if (st.grassPick && st.identify) q('.v3-ident').onclick();
     canvas.style.cursor = st.grassPick ? 'crosshair' : 'grab';
     if (!st.grassPick) q('.v3-gpanel').style.display = 'none';
   };
-  q('.v3-ident').onclick = () => { if (!st.identify && st.grassPick) q('.v3-grassb').onclick(); if (!st.identify && st.terra.on) q('.v3-terrab').onclick(); st.identify = !st.identify; q('.v3-ident').classList.toggle('on', st.identify); canvas.style.cursor = st.identify ? 'crosshair' : 'grab'; if (!st.identify && st.selObj) { gl.deleteBuffer(st.selObj.b); st.selObj = null; q('.v3-tip').style.display = 'none'; st.dirty = true; } };
+  q('.v3-ident').onclick = () => { if (!st.identify && st.grassPick) q('.v3-grassb').onclick(); if (!st.identify && st.terra.on) terraToggle(null); st.identify = !st.identify; q('.v3-ident').classList.toggle('on', st.identify); canvas.style.cursor = st.identify ? 'crosshair' : 'grab'; if (!st.identify && st.selObj) { gl.deleteBuffer(st.selObj.b); st.selObj = null; q('.v3-tip').style.display = 'none'; st.dirty = true; } };
 
   /* ---------- lighting panel ---------- */
   function fillLightPanel() {
@@ -5337,6 +6165,8 @@ function createView3D(host, deps) {
   };
   q('.lp-s').onchange = e => { st.light.shadows = e.target.value; saveLight(); st.shDirty = true; st.dirty = true; };
   q('.lp-l').onchange = e => { st.light.look = e.target.value; saveLight(); st.dirty = true; };
+  q('.lp-b').value = st.light.blend || 'natural';
+  q('.lp-b').onchange = e => { st.light.blend = e.target.value; saveLight(); st.dirty = true; };
 
   /* ---------- report: everything the tool knows about the 9 selected cells, as text to paste ---------- */
   async function report() {
@@ -5385,6 +6215,32 @@ function createView3D(host, deps) {
     const b = q('.v3-report'); b.textContent = '✓ Copied — paste it in your message'; setTimeout(() => b.textContent = '📋 Copy report', 2500);
   }
   q('.v3-report').onclick = () => report();
+  /* The effect models in view, byte for byte as the load order has them, and a manifest: which mod or archive each model and
+     texture comes from, and every placement (position, rotation, scale). */
+  q('.v3-fxexp').onclick = async () => {
+    const assets = deps.assets(), btn = q('.v3-fxexp'); if (!assets) return;
+    const fxObs = (st.objs || []).filter(o => o.bi.fx || (o.m && ((o.m.particles && o.m.particles.length) || o.m.shapes.some(s => s.fx))));
+    if (!fxObs.length) { btn.textContent = 'No effects in view'; setTimeout(() => { btn.textContent = '📦 Export effects'; }, 2500); return; }
+    btn.textContent = 'Exporting…';
+    const files = [], seen = new Map(), texSeen = new Map(), P = i => ctx().plugins[i] ? ctx().plugins[i].name : '?';
+    const meshPath = m => { let k = String(m).replace(/\//g, '\\'); return /^meshes\\/i.test(k) ? k : 'meshes\\' + k; };
+    for (const o of fxObs) {
+      const mp = meshPath(o.bi.model).toLowerCase();
+      if (!seen.has(mp)) {
+        let bytes = null, src = null; try { bytes = await assets.get(mp); src = await assets.source(mp); } catch (e) { bytes = null; }
+        seen.set(mp, { model: mp, source: src || 'not found', standIn: !!o.m.smokeStandIn, textures: [] });
+        if (bytes) files.push({ name: mp.replace(/\\/g, '/'), bytes: new Uint8Array(bytes) });
+        const tx = new Set(); for (const s of o.m.shapes || []) { if (s.fx || s.water) { if (s.tex) tx.add(s.tex); if (s.fx && s.fx.pal) tx.add(s.fx.pal); } } for (const p of o.m.particles || []) { if (p.tex) tx.add(p.tex); if (p.pal) tx.add(p.pal); }
+        for (const t of tx) { const k = t.toLowerCase(); if (!texSeen.has(k)) { let s2 = null; try { s2 = await assets.source(k); } catch (e) { s2 = null; } texSeen.set(k, s2 || 'not found'); } seen.get(mp).textures.push({ texture: k, source: texSeen.get(k) }); }
+      }
+    }
+    const placements = fxObs.map(o => ({ editorId: o.bi.edid, type: o.bi.t, model: meshPath(o.bi.model).toLowerCase(), placedBy: o.r.p != null ? P(o.r.p) : null, ref: o.r.key != null ? (o.r.key >>> 0).toString(16).toUpperCase().padStart(8, '0') : null,
+      position: [o.r.x, o.r.y, o.r.z].map(q => Math.round(q * 10) / 10), rotation: [o.r.rx || 0, o.r.ry || 0, o.r.rz || 0].map(q => Math.round(q * 1e4) / 1e4), scale: o.r.s || 1 }));
+    const manifest = { tool: 'Terrain Inspector', cells: st.cells.map(c => c.x + ',' + c.y), models: [...seen.values()], placements };
+    files.push({ name: 'effects-manifest.json', bytes: new TextEncoder().encode(JSON.stringify(manifest, null, 1)) });
+    const bytes = TSI.zipStore(files), a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' })); a.download = 'Terrain Inspector - effects.zip'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 500);
+    btn.textContent = `✓ ${seen.size} model(s) saved`; setTimeout(() => { btn.textContent = '📦 Export effects'; }, 3000);
+  };
 
   /* ---------- controls ---------- */
   host.querySelector('.v3-right').addEventListener('click', e => {
@@ -5392,6 +6248,7 @@ function createView3D(host, deps) {
     if (a === 'close') close(); else if (a && 'NSEW'.includes(a)) move(a);
   });
   host.querySelector('[data-a="structs"]').onchange = e => { st.structs = e.target.checked; st.dirty = true; };
+  host.querySelector('[data-a="fx"]').onchange = e => { st.fx = e.target.checked; st.dirty = true; };
   for (const k of ['water', 'walls']) host.querySelector(`[data-a="${k}"]`).onchange = e => { st[k] = e.target.checked; buildFlat(); st.dirty = true; };
   st.nums = true; st.grid = true;
   try { st.banner = localStorage.getItem('ti-banner') !== '0'; } catch (e) { st.banner = true; }
@@ -5490,7 +6347,7 @@ function createView3D(host, deps) {
   });
   new ResizeObserver(() => { st.dirty = true; }).observe(canvas);
 
-  return { open, reopen, close, _objs: () => st.objs || [], _drop: key => { const o = (st.objs || []).find(o => o.r.key === key); return o ? dropDelta(o) : undefined; }, _pick: (mx, my, ng) => { st._noGround = ng; const o = pickObject(mx, my); st._noGround = false; return o ? o.bi.edid : null; }, _ground: (mx, my) => pickGround(mx, my), _exag: () => st.exag, _proj: (x, y, z) => { const v = st.lastMvp; if (!v) return null; const px = x - st.origin[0], py = y - st.origin[1], pz = (z - st.origin[2]) * st.exag; const cx = v[0] * px + v[4] * py + v[8] * pz + v[12], cy = v[1] * px + v[5] * py + v[9] * pz + v[13], cw = v[3] * px + v[7] * py + v[11] * pz + v[15]; return cw > 0 ? [(cx / cw * 0.5 + 0.5) * canvas.clientWidth, (0.5 - cy / cw * 0.5) * canvas.clientHeight] : null; }, get isOpen() { return st.open; }, refresh() { if (st.open) { buildFlat(); renderSide(); if (st.navOn) buildNav(); st.dirty = true; } }, setNav, _st: st, isGL2 };
+  return { open, reopen, close, _water: () => ({ n: st.pwCount || 0, tris: st.pwBuf ? st.pwBuf.n / 3 : 0, bounds: st.pwBounds }), _fx: () => ({ surfaces: (st.fxBatches || []).length, emitters: (st.fxEmit || []).map(e => ({ o: e.o.map(Math.round), n: e.n, tex: e.tex, life: e.life })) }), _fxStill: on => { st.fxStill = on; st.dirty = true; }, _lookAt: (x, y, z, dist, pitch) => { st.target = [x - st.origin[0], y - st.origin[1], z - st.origin[2]]; if (dist) st.dist = dist; if (pitch != null) st.pitch = pitch; st.dirty = true; }, _objs: () => st.objs || [], _drop: key => { const o = (st.objs || []).find(o => o.r.key === key); return o ? dropDelta(o) : undefined; }, _identify: (mx, my) => { st._cpuPick = true; showObject(pickObject(mx, my), mx, my); st._cpuPick = false; }, _pick: (mx, my, ng) => { st._noGround = ng; const o = pickObject(mx, my); st._noGround = false; return o ? o.bi.edid : null; }, _ground: (mx, my) => pickGround(mx, my), _exag: () => st.exag, _proj: (x, y, z) => { const v = st.lastMvp; if (!v) return null; const px = x - st.origin[0], py = y - st.origin[1], pz = (z - st.origin[2]) * st.exag; const cx = v[0] * px + v[4] * py + v[8] * pz + v[12], cy = v[1] * px + v[5] * py + v[9] * pz + v[13], cw = v[3] * px + v[7] * py + v[11] * pz + v[15]; return cw > 0 ? [(cx / cw * 0.5 + 0.5) * canvas.clientWidth, (0.5 - cy / cw * 0.5) * canvas.clientHeight] : null; }, get isOpen() { return st.open; }, refresh() { if (st.open) { buildFlat(); renderSide(); if (st.navOn) buildNav(); st.dirty = true; } }, setNav, _st: st, isGL2 };
 }
 root.createView3D = createView3D;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -5514,7 +6371,7 @@ const S = {
   ctx: null, W: null,
   seams: [], water: [], floating: [], summary: [], worldStack: [],
   mode: 'relief', ov: { seams: true, grid: true, click3d: true, cities: true },
-  opts: { threshold: 0.5, showIgnored: true, showVanilla: false, waterThreshold: 4, checks: { height: true, texture: false, colour: false, shading: false, water: false, dupes: false } },
+  opts: { threshold: 0.5, showIgnored: true, showVanilla: false, waterThreshold: 4, checks: { height: true, texture: false, colour: false, shading: false, water: true, dupes: false } },
   tab: 'seams', openItem: null, selCell: null, hlPlugin: -1,
   view: { s: 1, tx: 0, ty: 0 }, PX: 32, img: null
 };
@@ -6465,9 +7322,9 @@ function recompute() {
   S.ignored = TSI.findIgnored(ctx, W, S.opts).filter(g => seenInGame(W, g))
     .concat(all.filter(sm => !seenInGame(W, sm)).map(sm => ({ a: sm.a, b: sm.b, dir: sm.dir, gap: sm.m.hMax, reason: 'never loaded in game (too far from where you can walk in this city)', pa: sm.pa, pb: sm.pb })));
   S.nav = TSI.navIssues(ctx, W).filter(n => seenPair(W, n.c, n.c));
-  navHealthStart();
+  navHealthStart(); holesStart();
   trackRun();
-  S.water = [];
+  S.water = TSI.findWaterSeams(ctx, W, S.opts).filter(w => seenInGame(W, w));
   S.floating = [];
   S.summary = TSI.pluginSummary(ctx, W, S.seams, S.water, S.floating);
 }
@@ -7060,11 +7917,11 @@ function withTerra(preset) {
 function patchExtras() { return S.patchExtra.w === S.W ? [...S.patchExtra.m.values()] : []; }
 function patchList() { return S.seams.filter(sm => !isHidden(sm)).concat(patchExtras()); }
 function terraEdits() { if (S.terra.w !== S.W || !S.terra.undo.length) return null; const m = new Map([...S.terra.m].filter(([, dz]) => dz)); return m.size ? m : null; }
-function patchLabel() { const n = S.seams.filter(sm => !isHidden(sm)).length, e = patchExtras().length, g = S.terra.w === S.W ? S.terra.undo.length : 0; return [n && `${n} seam${n === 1 ? '' : 's'}`, e && `${e} warning${e === 1 ? '' : 's'}`, g && `${g} ground edit${g === 1 ? '' : 's'}`].filter(Boolean).join(' + '); }
+function patchLabel() { const n = S.seams.filter(sm => !isHidden(sm)).length, e = patchExtras().length, f = fillList().length + ovfPicked().length + waterPicked().length, g = S.terra.w === S.W ? S.terra.undo.length : 0; return [n && `${n} seam${n === 1 ? '' : 's'}`, e && `${e} warning${e === 1 ? '' : 's'}`, f && `${f} lost texture${f === 1 ? '' : 's'}`, g && `${g} ground edit${g === 1 ? '' : 's'}`].filter(Boolean).join(' + '); }
 function patchPreview() {
-  const W = S.W, list = patchList(), sig = list.length + ':' + patchExtras().map(g => g.k).join('|');
+  const W = S.W, list = patchList(), sig = list.length + ':' + patchExtras().map(g => g.k).join('|') + ':' + fillList().map(f => f.x + ',' + f.y).join('|') + ':' + ovfPicked().map(f => f.x + ',' + f.y).join('|');
   if (S.patchPv && S.patchPv.w === W && S.patchPv.seams === S.seams && S.patchPv.sig === sig) return S.patchPv.map;
-  let map = null; try { map = TSI.buildSeamPatch(S.ctx, W, list).preview || null; } catch (e) { console.warn('patch preview', e); }
+  let map = null; try { map = TSI.buildSeamPatch(S.ctx, W, list, null, [], [], fillList(), ovfPicked()).preview || null; } catch (e) { console.warn('patch preview', e); }
   S.patchPv = { w: W, seams: S.seams, sig, map };
   return map;
 }
@@ -7080,14 +7937,14 @@ const INST = '<li>Install the .zip like any mod (MO2: Install a new mod from arc
 function makeSeamPatch() {
   const W = S.W, list = patchList();
   const ed = terraEdits();
-  let r; try { r = TSI.buildSeamPatch(S.ctx, W, list, ed, blendEdges(), texStrokes()); } catch (e) { r = { bytes: null, error: e.message || String(e), failed: [], left: [] }; }
+  let r; try { r = TSI.buildSeamPatch(S.ctx, W, list, ed, blendEdges(), texStrokes(), fillList(), ovfPicked(), waterPicked()); } catch (e) { r = { bytes: null, error: e.message || String(e), failed: [], left: [] }; }
   const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), name = `Terrain Inspector - Seam Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}.esp`;
   let hmsg;
   if (!r.bytes) hmsg = `<div class="errbox" style="margin-top:8px">No patch could be made${r.error ? ` (${esc(r.error)})` : ': the ground is too steep at these borders'}.</div>`;
   else {
     savePatch([{ name, bytes: r.bytes }], zipOf(name));
     const skipped = list.length - r.fixed;
-    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}.<ol style="margin:6px 0 0 18px;padding:0">${r.replaces && r.replaces.length ? `<li><b>It also holds everything from your earlier ${r.replaces.map(esc).join(', ')}</b> (${r.carried} cell${r.carried === 1 ? '' : 's'} carried over), so it <b>replaces</b> ${r.replaces.length > 1 ? 'them' : 'it'}: install it over the old one (MO2: same name → Replace) or switch the old one off. Keep only one.</li>` : ''}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
+    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.filled ? `lost textures put back in ${r.filled} cell${r.filled === 1 ? '' : 's'}, ` : ''}${r.overflowed ? `${r.overflowed} cell${r.overflowed === 1 ? '' : 's'} brought back to 6 textures, ` : ''}${r.rebased ? `${r.rebased} base texture${r.rebased === 1 ? '' : 's'} put back, ` : ''}${r.relaid ? `${r.relaid} quarter${r.relaid === 1 ? '' : 's'} back to their original layout, ` : ''}${r.watered ? `${r.watered} water level${r.watered === 1 ? '' : 's'} matched, ` : ''}${r.reedged ? `${r.reedged} quarter-edge point${r.reedged === 1 ? '' : 's'} restored, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}${r.texHeld ? `. ${r.texHeld} quarter-cell${r.texHeld === 1 ? '' : 's'} kept ${r.texHeld === 1 ? 'its' : 'their'} original textures: the new mix could not be stored exactly there (too many textures), so the tool left ${r.texHeld === 1 ? 'it' : 'them'} as ${r.texHeld === 1 ? 'it was' : 'they were'} instead of risking a visible patch` : ''}.<ol style="margin:6px 0 0 18px;padding:0">${r.replaces && r.replaces.length ? `<li><b>It also holds everything from your earlier ${r.replaces.map(esc).join(', ')}</b> (${r.carried} cell${r.carried === 1 ? '' : 's'} carried over), so it <b>replaces</b> ${r.replaces.length > 1 ? 'them' : 'it'}: install it over the old one (MO2: same name → Replace) or switch the old one off. Keep only one.</li>` : ''}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
   }
   S.patchMsg = { w: W, h: hmsg };
   return hmsg;
@@ -7112,6 +7969,32 @@ function navHealthStart() {
     } catch (e) { console.warn('navmesh check', e); job.busy = false; job.err = e.message || String(e); if (S.navH === job) renderPane(); }
   }, 60);
 }
+/* texture / colour lines: found in the background after the seams, listed with the warnings */
+function linesStart() {
+  const W = S.W; if (S.lines && S.lines.w === W) return;
+  const job = S.lines = { w: W, list: null };
+  setTimeout(async () => {
+    try { const list = await TSI.surfaceSeams(S.ctx, W, () => new Promise(r => setTimeout(r, 0))); if (S.lines !== job) return; job.list = list; renderPane(); draw(); }
+    catch (e) { console.warn('texture lines', e); }
+  }, 120);
+}
+/* lost textures (the standard ground dirt02 showing where an earlier version had real textures): found in the background */
+function holesStart() {
+  const W = S.W; if (S.holes && S.holes.w === W) return;
+  const job = S.holes = { w: W, list: null };
+  setTimeout(async () => {
+    try { const yld = () => new Promise(r => setTimeout(r, 0)), list = [], ovf = await TSI.textureOverflow(S.ctx, W, yld); if (S.holes !== job) return; job.list = list; job.ovf = ovf; job.order = TSI.ownPatchOrder(S.ctx, W); job.based = TSI.ownBaseLost(S.ctx, W); job.relaid = TSI.ownRebuilt(S.ctx, W).reduce((n, o) => n + o.quads.length, 0); job.edges = [...TSI.ownEdgeLost(S.ctx, W).values()].reduce((a, m) => a + [...m.values()].reduce((b, p) => b + p.size, 0), 0); renderPane(); }
+    catch (e) { console.warn('texture holes', e); }
+  }, 150);
+}
+function holeList() { return S.holes && S.holes.w === S.W && S.holes.list ? S.holes.list : []; }
+function orderBad() { return S.holes && S.holes.w === S.W ? (S.holes.order || 0) + baseLost().length + (S.holes.relaid || 0) + (S.holes.edges || 0) : 0; }
+function baseLost() { return S.holes && S.holes.w === S.W && S.holes.based ? S.holes.based : []; }
+function waterKey(w) { return `${w.a.x},${w.a.y},${w.dir}`; }
+function waterPicked() { if (!S.wfix || S.wfix.w !== S.W) return []; return [...S.wfix.m.values()]; }
+function ovfList() { return S.holes && S.holes.w === S.W && S.holes.ovf ? S.holes.ovf : []; }
+function ovfPicked() { return S.ovfs && S.ovfs.w === S.W ? [...S.ovfs.m.values()] : []; }
+function fillList() { return S.fills && S.fills.w === S.W ? [...S.fills.m.values()] : []; }
 function navRes() { return S.navH && S.navH.w === S.W ? S.navH.res : null; }
 function navWhere(d) {
   if (d.world == null) return 'interior ' + (d.edid || 'cell ' + TSI.keyLabel(S.ctx, d.cell).replace('|', ' '));
@@ -7246,14 +8129,19 @@ function seamDetail(sm) {
 const WARN = {
   main:  { col: '#f0c83c', rgba: 'rgba(240,200,60,.95)', title: 'Vanilla & small seams', note: 'Gaps that exist in the unmodded game or are small: still visible, worth a look.' },
   water: { col: '#3fd17a', rgba: 'rgba(63,209,122,.95)', title: 'Under water', note: 'Gaps on the lake or river bed.' },
-  minor: { col: '#e6e6e6', rgba: 'rgba(235,235,235,.9)', title: 'Never seen in game', note: 'Too far from where you can walk inside a walled city: the game never loads them in full.' }
+  minor: { col: '#e6e6e6', rgba: 'rgba(235,235,235,.9)', title: 'Never seen in game', note: 'Too far from where you can walk inside a walled city: the game never loads them in full.' },
+  line:  { col: '#c58cff', rgba: 'rgba(197,140,255,.95)', title: 'Texture & colour lines', note: 'The ground meets, but the two cells disagree on the border about the ground texture or its shading colours: a straight line shows there in game. Tick them (or all) to put them in the seam patch: both cells meet in the middle and the change fades into each cell.' }
 };
 const warnCat = reason => /under water/.test(reason) ? 'water' : /covered|never loaded|inside the city/.test(reason) ? 'minor' : 'main';
-const WARN_ORDER = { main: 0, water: 1, minor: 2 };
+const WARN_ORDER = { main: 0, line: 1, water: 2, minor: 3 };
 function warnList() {
   const hidden = S.seams.filter(isHidden);
+  const taken = new Set([...S.seams, ...(S.ignored || [])].map(g => `${g.a.x},${g.a.y},${g.dir}`));   // a height seam gets its textures and colours fixed with it
+  const lines = S.lines && S.lines.w === S.W && S.lines.list ? S.lines.list.filter(l => !taken.has(`${l.a.x},${l.a.y},${l.dir}`)).map(l => ({
+    a: l.a, b: l.b, dir: l.dir, pa: l.pa, pb: l.pb, cat: 'line', gap: Math.max(l.tex * 100, l.col),
+    reason: [l.tex && `ground texture differs by ${Math.round(l.tex * 100)}%`, l.col && `shading colour differs by ${l.col}`].filter(Boolean).join(' and ') + ' on the border' })) : [];
   return (S.ignored || []).concat(hidden.map(sm => { const c = S.cover.get(seamKey(sm)); return { a: sm.a, b: sm.b, dir: sm.dir, gap: sm.m.hMax, reason: `covered by ${c && c.by.length ? c.by.join(', ') : 'an object'} in game`, pa: sm.pa, pb: sm.pb }; }))
-    .map(g => ({ ...g, cat: warnCat(g.reason) }))
+    .map(g => ({ ...g, cat: warnCat(g.reason) })).concat(lines)
     .sort((x, y) => (WARN_ORDER[x.cat] - WARN_ORDER[y.cat]) || (y.gap - x.gap));
 }
 function renderPane() {
@@ -7263,7 +8151,7 @@ function renderPane() {
   const ign = warnList();
   const nav = S.nav || [], NH = navRes(), nDel = NH ? NH.deleted.length : 0, nPair = NH ? NH.pairs.length : 0, navCount = nav.length + nDel + nPair;
   const tab = S.paneTab === 'nav' && !navCount ? 'seams' : S.paneTab || 'seams';
-  let h = `<div class="ptabs"><button class="ptab ${tab === 'seams' ? 'on' : ''}" data-tab="seams"><b class="bang">!</b> Seams (${visible.length})</button><button class="ptab ign ${tab === 'ignored' ? 'on' : ''}" data-tab="ignored">⚠ Warnings (${ign.length})</button>${navCount ? `<button class="ptab ${tab === 'nav' ? 'on' : ''}" data-tab="nav" title="Navmesh problems: deleted navmeshes, broken links between navmeshes, paths off the ground">🚶 Paths (${navCount})</button>` : ''}</div>`;
+  let h = `<div class="ptabs"><button class="ptab ${tab === 'seams' ? 'on' : ''}" data-tab="seams"><b class="bang">!</b> Seams (${visible.length})</button><button class="ptab ign ${tab === 'ignored' ? 'on' : ''}" data-tab="ignored">⚠ Warnings (${ign.length + holeList().length + ovfList().length + (S.water || []).length + (orderBad() ? 1 : 0)})</button>${navCount ? `<button class="ptab ${tab === 'nav' ? 'on' : ''}" data-tab="nav" title="Navmesh problems: deleted navmeshes, broken links between navmeshes, paths off the ground">🚶 Paths (${navCount})</button>` : ''}</div>`;
   if (tab === 'nav' && navCount) {
     const F = navFiltered();
     const sel = S.navSel, fixDel = NH ? F.del.filter(d => d.fixable).length : 0, cal = NH ? NH.cal : null;
@@ -7324,17 +8212,48 @@ function renderPane() {
     h += `<p class="muted" style="font-size:12.5px;margin:6px 0 10px">Warning seams: every other cell border where the ground doesn't meet perfectly, most important first. Colours match the map and the 3D view.</p>`;
     h += `<label style="display:block;font-size:13px;margin-bottom:8px"><input type="checkbox" id="showIgn" ${S.opts.showIgnored ? 'checked' : ''}> Show warning seams on the map and in 3D</label>`;
     if (!ign.length) h += `<div class="empty">Every other border meets perfectly.</div>`;
-    const canPatch = !W.landFromParent, nx = patchExtras().length;
-    if (ign.length && canPatch) h += `<div class="patchbox" style="font-size:12.5px">Want one fixed anyway? Tick <b>🛠</b> on a warning to add it to the seam patch.${nx ? ` <b>${nx} ticked.</b> <button class="primary small" id="mkPatch">🛠 Create a patch for ${patchLabel()}</button> <button class="small" id="pvPatchW">👁 Preview</button>` : ''}<div id="patchMsg"></div></div>`;
+    const canPatch = !W.landFromParent, holes = holeList(), ovf = ovfList(), wat = S.water || [], nx = patchExtras().length + fillList().length + ovfPicked().length + waterPicked().length;
+    if ((ign.length || holes.length || ovf.length || wat.length) && canPatch) h += `<div class="patchbox" style="font-size:12.5px">Want one fixed anyway? Tick <b>🛠</b> on a warning to add it to the seam patch.${nx ? ` <b>${nx} ticked.</b> <button class="primary small" id="mkPatch">🛠 Create a patch for ${patchLabel()}</button> <button class="small" id="pvPatchW">👁 Preview</button>` : ''}<div id="patchMsg"></div></div>`;
+    if (orderBad() && canPatch) h += `<div class="wgroup"><div class="whead" style="color:#ff6b6b"><span class="wdot" style="background:#ff6b6b"></span>Your seam patch needs rewriting</div><div class="muted" style="font-size:12px;margin:0 0 6px">${baseLost().length ? `An older version of this tool removed the <b>base texture</b> of ${baseLost().reduce((n, o) => n + o.quads.length, 0)} quarter(s) of cells in your seam patch and put the game's standard ground (dirt02) there. On paper the layers above still give the same ground, which is why it looked fine here, but in game such a quarter shows as a hard-edged square of dirt02. ` : ''}${S.holes.relaid ? `${S.holes.relaid} quarter(s) were rebuilt with another layer layout than the plugin under the patch; the game does not always draw a rebuilt quarter like the original, which can show as a square. ` : ''}${S.holes.edges ? `On ${S.holes.edges} point(s) of the lines between quarters (stored twice, once per quarter), the patch overwrote one quarter's copy with the other's, which shows as a stripe along the quarter's edge. ` : ''}${S.holes.order ? `${S.holes.order} cell(s) also have their texture data out of the usual order (harmless, tidied up too). ` : ''}Rewrite the patch: every rewritten quarter keeps its original layout and its original values wherever nothing was meant to change, and your seam fixes are kept.</div>${baseLost().map((o, i) => `<div class="item baseitem" data-bl="${i}" style="border-left:3px solid #ff6b6b"><div class="top"><b>▣ cell ${o.x},${o.y}</b><span class="muted">${o.quads.map(q => ['bottom-left', 'bottom-right', 'top-left', 'top-right'][q]).join(', ')} quarter${o.quads.length === 1 ? '' : 's'}</span></div><div class="sub">base texture removed · ${esc(P(o.from).name)} has one there</div></div>`).join('')}<button class="primary small" id="mkOrder">🛠 Rewrite my seam patch</button><div id="orderMsg"></div></div>`;
+    if (holes.length) {
+      const fk = new Set(fillList().map(f => f.x + ',' + f.y));
+      h += `<div class="wgroup"><div class="whead" style="color:#ff9d5c"><span class="wdot" style="background:#ff9d5c"></span>Lost textures (${holes.length})${canPatch ? ` <button class="small" data-hall style="margin-left:6px">🛠 Tick all</button>` : ''}</div><div class="muted" style="font-size:12px;margin:0 0 6px">The game's standard ground (dirt02, used where a cell has no texture set) shows here, but an earlier version of the cell in your load order had real textures. It shows in game as a hard-edged patch of plain dirt. Tick it: the patch puts back the textures that earlier version had, with a soft edge.</div>`;
+      holes.forEach((o, i) => {
+        h += `<div class="item holeitem" data-ho="${i}" style="border-left:3px solid #ff9d5c"><div class="top"><b>🕳 cell ${o.x},${o.y}</b><span class="muted">${o.n} point${o.n === 1 ? '' : 's'}</span>${canPatch ? `<label class="wfix" title="Put back the earlier textures in the seam patch"><input type="checkbox" data-hfix="${i}" ${fk.has(o.x + ',' + o.y) ? 'checked' : ''}> 🛠</label>` : ''}</div>
+          <div class="sub">plain dirt since <b>${esc(P(o.by).name)}</b> · textures before: ${esc(P(o.from).name)}</div></div>`;
+      });
+      h += `</div>`;
+    }
+    if (wat.length) {
+      if (!S.wfix || S.wfix.w !== W) S.wfix = { w: W, m: new Map(), pick: new Map() };
+      const allOn = wat.every(w => S.wfix.m.has(waterKey(w)));
+      h += `<div class="wgroup"><div class="whead" style="color:#4fb3ff"><span class="wdot" style="background:#4fb3ff"></span>Water level steps (${wat.length})${canPatch ? ` <button class="small" data-wtall data-on="${allOn ? 1 : 0}" style="margin-left:6px">${allOn ? '✕ Untick all' : '🛠 Tick all'}</button>` : ''}</div><div class="muted" style="font-size:12px;margin:0 0 6px">Two cells side by side have their water at different heights, and a mod made that happen: in game the water ends in a step or a wall at the cell border. A cell has one water level for the whole cell, so pick which side changes; each choice says how much of that cell's ground goes under water (or comes out of it). The suggested one brings back a level the cell already had in an earlier plugin (usually a water mod's, lost to a later mod).</div>`;
+      wat.forEach((w, i) => {
+        const k = waterKey(w), pk = S.wfix.pick.has(k) ? S.wfix.pick.get(k) : w.pick, on = S.wfix.m.has(k);
+        const opt = (j) => { const f = w.fix[j], other = j === 0 ? w.b : w.a; const fl = f.flood > 0.005 ? ` · <b style="color:#ffb84d">floods ${Math.round(f.flood * 100)}% of its ground</b>` : f.dry > 0.005 ? ` · ${Math.round(f.dry * 100)}% of its ground comes out of the water` : ' · no ground changes side'; return `<label style="display:block;margin:2px 0;cursor:pointer"><input type="radio" name="wp${i}" data-wpick="${i}" value="${j}" ${pk === j ? 'checked' : ''}> cell <b>${f.x},${f.y}</b> to ${Math.round(f.level)} (like ${other.x},${other.y})${f.had >= 0 ? ` <span class="muted">— it had this in ${esc(P(f.had).name)}</span>` : ''}${fl}${j === w.pick ? ' <span style="color:#7fd47f">✓ suggested</span>' : ''}</label>`; };
+        h += `<div class="item wtitem" data-wt="${i}" style="border-left:3px solid #4fb3ff"><div class="top"><b>💧 ${w.a.x},${w.a.y} ${w.dir === 'E' ? '↔' : '↕'} ${w.b.x},${w.b.y}</b><span class="muted">${Math.round(w.d)} u step</span>${canPatch ? `<label class="wfix" title="Match the water levels in the seam patch"><input type="checkbox" data-wtfix="${i}" ${on ? 'checked' : ''}> 🛠</label>` : ''}</div>
+          <div class="sub">${w.a.x},${w.a.y}: ${Math.round(w.wa)} (${esc(P(w.pa).name)}) · ${w.b.x},${w.b.y}: ${Math.round(w.wb)} (${esc(P(w.pb).name)})</div>${canPatch ? `<div class="sub" style="margin-top:4px">${opt(0)}${opt(1)}</div>` : ''}</div>`;
+      });
+      h += `</div>`;
+    }
+    if (ovf.length) {
+      const ok2 = new Set(ovfPicked().map(f => f.x + ',' + f.y));
+      h += `<div class="wgroup"><div class="whead" style="color:#e0b84d"><span class="wdot" style="background:#e0b84d"></span>Too many textures (${ovf.length})${canPatch ? (ovf.every(o => ok2.has(o.x + ',' + o.y)) ? ` <button class="small" data-oall data-on="1" style="margin-left:6px">✕ Untick all</button>` : ` <button class="small" data-oall data-on="0" style="margin-left:6px">🛠 Tick all</button>`) : ''}</div><div class="muted" style="font-size:12px;margin:0 0 6px">A quarter of these cells holds more than 6 ground textures. The game draws only 6 and leaves the rest out, so in game that quarter shows different ground with hard, straight edges (merged landscape patches often cause this). The 3D view draws it the way the game does. Tick it: the patch lays the quarter out again with the 6 textures that cover the most ground.</div>`;
+      ovf.forEach((o, i) => {
+        h += `<div class="item ovfitem" data-ov="${i}" style="border-left:3px solid #e0b84d"><div class="top"><b>▦ cell ${o.x},${o.y}</b><span class="muted">${Object.keys(o.quads).length} quarter${Object.keys(o.quads).length === 1 ? '' : 's'} · ${o.n} points</span>${canPatch ? `<label class="wfix" title="Lay these quarters out again with 6 textures in the seam patch"><input type="checkbox" data-ofix="${i}" ${ok2.has(o.x + ',' + o.y) ? 'checked' : ''}> 🛠</label>` : ''}</div>
+          <div class="sub">by <b>${esc(P(o.by).name)}</b> · left out in game: ${esc(o.tex.join(', '))}</div></div>`;
+      });
+      h += `</div>`;
+    }
     let shown = 0;
-    for (const cat of ['main', 'water', 'minor']) {
+    for (const cat of ['main', 'line', 'water', 'minor']) {
       const group = ign.map((g, i) => [g, i]).filter(([g]) => g.cat === cat);
       if (!group.length) continue;
       const W0 = WARN[cat];
-      h += `<div class="wgroup"><div class="whead" style="color:${W0.col}"><span class="wdot" style="background:${W0.col}"></span>${W0.title} (${group.length})</div><div class="muted" style="font-size:12px;margin:0 0 6px">${W0.note}</div>`;
+      h += `<div class="wgroup"><div class="whead" style="color:${W0.col}"><span class="wdot" style="background:${W0.col}"></span>${W0.title} (${group.length})${canPatch ? (() => { const pk = new Set(patchExtras().map(x => x.k)), all = group.every(([g]) => pk.has(`${g.a.x},${g.a.y},${g.dir}`)); return ` <button class="small" data-wall="${cat}" data-on="${all ? 1 : 0}" style="margin-left:6px">${all ? '✕ Untick all' : '🛠 Tick all'}</button>`; })() : ''}</div><div class="muted" style="font-size:12px;margin:0 0 6px">${W0.note}</div>`;
       for (const [g, i] of group) {
         if (shown++ >= 800) break;
-        h += `<div class="item ignitem" data-ig="${i}" style="border-left:3px solid ${W0.col}"><div class="top"><b class="bang" style="background:${W0.col};color:#1a1a1a">!</b><b>${g.a.x},${g.a.y} ${g.dir === 'E' ? '↔' : '↕'} ${g.b.x},${g.b.y}</b><span class="muted">${fmt(g.gap)} u</span>${canPatch ? `<label class="wfix" title="Add this border to the seam patch"><input type="checkbox" data-wfix="${i}" ${patchExtras().some(e => e.k === `${g.a.x},${g.a.y},${g.dir}`) ? 'checked' : ''}> 🛠</label>` : ''}</div>
+        h += `<div class="item ignitem" data-ig="${i}" style="border-left:3px solid ${W0.col}"><div class="top"><b class="bang" style="background:${W0.col};color:#1a1a1a">!</b><b>${g.a.x},${g.a.y} ${g.dir === 'E' ? '↔' : '↕'} ${g.b.x},${g.b.y}</b><span class="muted">${g.cat === 'line' ? 'line' : fmt(g.gap) + ' u'}</span>${canPatch ? `<label class="wfix" title="Add this border to the seam patch"><input type="checkbox" data-wfix="${i}" ${patchExtras().some(e => e.k === `${g.a.x},${g.a.y},${g.dir}`) ? 'checked' : ''}> 🛠</label>` : ''}</div>
           <div class="sub"><span style="color:${W0.col}">${esc(g.reason)}</span> · ${esc(P(g.pa).name)}${g.pa !== g.pb ? ' | ' + esc(P(g.pb).name) : ''}</div></div>`;
       }
       h += `</div>`;
@@ -7343,12 +8262,33 @@ function renderPane() {
     pane.innerHTML = h;
     pane.querySelectorAll('.ptab').forEach(b => b.onclick = () => { S.paneTab = b.dataset.tab; renderPane(); });
     const si = $('#showIgn'); if (si) si.onchange = () => { S.opts.showIgnored = si.checked; draw(); V3.refresh(); };
+    const setFill = (o, on) => { if (!S.fills || S.fills.w !== W) S.fills = { w: W, m: new Map() }; const k = o.x + ',' + o.y; if (on) S.fills.m.set(k, o); else S.fills.m.delete(k); };
+    pane.querySelectorAll('[data-hfix]').forEach(cb => { cb.parentElement.onclick = e => e.stopPropagation(); cb.onchange = () => { setFill(holes[Number(cb.dataset.hfix)], cb.checked); renderPane(); }; });
+    const setOvf = (o, on) => { if (!S.ovfs || S.ovfs.w !== W) S.ovfs = { w: W, m: new Map() }; const k = o.x + ',' + o.y; if (on) S.ovfs.m.set(k, o); else S.ovfs.m.delete(k); };
+    pane.querySelectorAll('[data-ofix]').forEach(cb => { cb.parentElement.onclick = e => e.stopPropagation(); cb.onchange = () => { setOvf(ovf[Number(cb.dataset.ofix)], cb.checked); renderPane(); }; });
+    const oa = pane.querySelector('[data-oall]'); if (oa) oa.onclick = e => { e.stopPropagation(); const on = oa.dataset.on !== '1'; ovf.forEach(o => setOvf(o, on)); renderPane(); };
+    pane.querySelectorAll('.ovfitem').forEach(el => el.onclick = () => { const o = ovf[Number(el.dataset.ov)]; focusCell(o.x, o.y, 4); const c = W.cells.get(W.coordKey(o.x, o.y)); if (c) { S.selCell = c; open3D(c); } });
+    const setWat = (w, on) => { const k = waterKey(w), j = S.wfix.pick.has(k) ? S.wfix.pick.get(k) : w.pick, f = w.fix[j]; if (on) S.wfix.m.set(k, { x: f.x, y: f.y, level: f.level }); else S.wfix.m.delete(k); };
+    pane.querySelectorAll('[data-wtfix]').forEach(cb => { cb.parentElement.onclick = e => e.stopPropagation(); cb.onchange = () => { setWat(wat[Number(cb.dataset.wtfix)], cb.checked); renderPane(); }; });
+    pane.querySelectorAll('[data-wpick]').forEach(rb => { rb.parentElement.onclick = e => e.stopPropagation(); rb.onchange = () => { const w = wat[Number(rb.dataset.wpick)], k = waterKey(w); S.wfix.pick.set(k, Number(rb.value)); if (S.wfix.m.has(k)) setWat(w, true); else setWat(w, true); renderPane(); }; });
+    const wta = pane.querySelector('[data-wtall]'); if (wta) wta.onclick = e => { e.stopPropagation(); const on = wta.dataset.on !== '1'; wat.forEach(w => setWat(w, on)); renderPane(); };
+    pane.querySelectorAll('.wtitem').forEach(el => el.onclick = () => { const w = wat[Number(el.dataset.wt)]; focusCell(w.a.x, w.a.y, 4); const c = W.cells.get(W.coordKey(w.a.x, w.a.y)); if (c) { S.selCell = c; open3D(c); } });
+    const ha = pane.querySelector('[data-hall]'); if (ha) ha.onclick = e => { e.stopPropagation(); holes.forEach(o => setFill(o, true)); renderPane(); };
+    pane.querySelectorAll('.holeitem').forEach(el => el.onclick = () => { const o = holes[Number(el.dataset.ho)]; focusCell(o.x, o.y, 4); const c = W.cells.get(W.coordKey(o.x, o.y)); if (c) { S.selCell = c; open3D(c); } });
+    pane.querySelectorAll('[data-wall]').forEach(b => b.onclick = e => {
+      e.stopPropagation(); if (S.patchExtra.w !== W) S.patchExtra = { w: W, m: new Map() };
+      const off = b.dataset.on === '1';   // everything in the group already ticked: the button unticks them all
+      for (const g of ign) if (g.cat === b.dataset.wall) { const k = `${g.a.x},${g.a.y},${g.dir}`; if (off) S.patchExtra.m.delete(k); else S.patchExtra.m.set(k, { k, a: g.a, b: g.b, dir: g.dir, m: { hMax: g.gap } }); }
+      renderPane();
+    });
     pane.querySelectorAll('[data-wfix]').forEach(cb => { cb.parentElement.onclick = e => e.stopPropagation(); cb.onchange = () => {
       const g = ign[Number(cb.dataset.wfix)], k = `${g.a.x},${g.a.y},${g.dir}`;
       if (S.patchExtra.w !== W) S.patchExtra = { w: W, m: new Map() };
       if (cb.checked) S.patchExtra.m.set(k, { k, a: g.a, b: g.b, dir: g.dir, m: { hMax: g.gap } }); else S.patchExtra.m.delete(k);
       renderPane();
     }; });
+    pane.querySelectorAll('.baseitem').forEach(el => el.onclick = () => { const o = baseLost()[Number(el.dataset.bl)]; focusCell(o.x, o.y, 4); const c = W.cells.get(W.coordKey(o.x, o.y)); if (c) { S.selCell = c; open3D(c); } });
+    const mko = $('#mkOrder'); if (mko) mko.onclick = () => { $('#orderMsg').innerHTML = makeSeamPatch(); };
     const mpw = $('#mkPatch'); if (mpw) mpw.onclick = () => { $('#patchMsg').innerHTML = makeSeamPatch(); };
     const pvw = $('#pvPatchW'); if (pvw) pvw.onclick = () => {
       const pv = patchPreview(), list = patchList(), g = patchExtras()[0], i = list.indexOf(g);
@@ -7370,7 +8310,7 @@ function renderPane() {
   const pvOn = S.pv && S.pv.w === W && V3.isOpen && patchList().length;
   if (pvOn) { const visible = patchList(); const sm = visible[Math.min(S.pv.i, visible.length - 1)]; h += `<div class="pvbar"><b>👁 Patch preview</b><button class="small" id="pvPrev" title="Previous seam">◀</button><span>seam ${Math.min(S.pv.i, visible.length - 1) + 1} / ${visible.length} · ${sm.a.x},${sm.a.y} ${sm.dir === 'E' ? '↔' : '↕'} ${sm.b.x},${sm.b.y}</span><button class="small" id="pvNext" title="Next seam">▶</button><button class="small" id="pvExit" style="margin-left:auto">Exit preview</button><div class="muted" style="flex-basis:100%;font-size:12px">Green marks show where each seam was. Click any seam below to jump to it with the patch applied.</div></div>`; }
   const plist = patchList();
-  if ((plist.length || terraEdits() || blendEdges().length || texStrokes().length) && !W.landFromParent && TSI.buildSeamPatch) h += `<div class="patchbox"><button class="primary small" id="mkPatch" title="A small plugin that makes the ground and its textures meet at these borders. It only overrides the ground of those cells: your load order is not touched.">🛠 Create a patch for ${patchLabel()}</button>${plist.length ? ` <button class="small" id="pvPatch" title="Opens each border in 3D with the patch applied, so you see the result before creating anything">👁 Preview it in 3D</button>` : ''}<div class="muted" style="font-size:12px;margin-top:4px">Small or vanilla seams can be added too: tick them in the ⚠ Warnings tab.</div><div id="patchMsg">${S.patchMsg && S.patchMsg.w === W ? S.patchMsg.h : ''}</div></div>`;
+  if ((plist.length || terraEdits() || blendEdges().length || texStrokes().length || fillList().length || ovfPicked().length || waterPicked().length) && !W.landFromParent && TSI.buildSeamPatch) h += `<div class="patchbox"><button class="primary small" id="mkPatch" title="A small plugin that makes the ground and its textures meet at these borders. It only overrides the ground of those cells: your load order is not touched.">🛠 Create a patch for ${patchLabel()}</button>${plist.length ? ` <button class="small" id="pvPatch" title="Opens each border in 3D with the patch applied, so you see the result before creating anything">👁 Preview it in 3D</button>` : ''}<div class="muted" style="font-size:12px;margin-top:4px">Small or vanilla seams can be added too: tick them in the ⚠ Warnings tab.</div><div id="patchMsg">${S.patchMsg && S.patchMsg.w === W ? S.patchMsg.h : ''}</div></div>`;
   h += settingsHtml();
   if (!visible.length) h += `<div class="empty">No seams here. 🎉</div>`;
   if (ign.length) h += `<p class="muted" style="font-size:12.5px;margin:4px 0 10px">Plus ${ign.length} warning seam${ign.length === 1 ? '' : 's'} (vanilla, small, under water…): see <a href="#" id="toIgn">⚠ Warnings</a>.</p>`;
