@@ -499,11 +499,24 @@ const OFFICIAL = ['skyrim.esm', 'update.esm', 'dawnguard.esm', 'hearthfires.esm'
 const FLAG_COMPRESSED = 0x00040000, FLAG_DELETED = 0x20, FLAG_DISABLED = 0x800;
 const NAMEBASE = 16777216;
 
-let textDec;
+/* Text in plugins has no stated encoding: each translation uses its own. English and other Western ones use Windows-1252,
+   Russian ones Windows-1251 or UTF-8, Chinese, Japanese, Korean and many recent translations UTF-8. So each text is read as
+   UTF-8 when it is valid UTF-8 (which Windows-1252/1251 text with accents practically never is), otherwise as Windows-1251 when
+   it is mostly letters from the upper half (a Cyrillic word), otherwise as Windows-1252. */
+let decUtf8, dec1252, dec1251;
 function zstr(u8, s, e) {
-  let end = s; while (end < e && u8[end] !== 0) end++;
-  if (!textDec) { try { textDec = new TextDecoder('windows-1252'); } catch (_) { textDec = new TextDecoder('latin1'); } }
-  return textDec.decode(u8.subarray(s, end));
+  let end = s, high = 0, ascL = 0;
+  while (end < e && u8[end] !== 0) { const c = u8[end]; if (c >= 128) high++; else if ((c | 32) >= 97 && (c | 32) <= 122) ascL++; end++; }
+  const b = u8.subarray(s, end);
+  if (!high) return b.length < 8192 ? String.fromCharCode.apply(null, b) : (dec1252 || (dec1252 = new TextDecoder('latin1'))).decode(b);
+  if (!decUtf8) {
+    decUtf8 = new TextDecoder('utf-8', { fatal: true });
+    try { dec1252 = new TextDecoder('windows-1252'); } catch (_) { dec1252 = new TextDecoder('latin1'); }
+    try { dec1251 = new TextDecoder('windows-1251'); } catch (_) { dec1251 = dec1252; }
+  }
+  try { return decUtf8.decode(b); } catch (_) { /* not UTF-8 */ }
+  let cyr = 0; for (let i = 0; i < b.length; i++) if (b[i] >= 0xC0 || b[i] === 0xA8 || b[i] === 0xB8) cyr++;   // А–я, Ё, ё
+  return (cyr >= 2 && cyr > ascL) ? dec1251.decode(b) : dec1252.decode(b);
 }
 
 function newContext(opts) {
@@ -3125,7 +3138,7 @@ const api = {
   navHealth, navCalibrate, buildNavPatch, nvnmParse, navParse,
   isCityWorld, buildSeamPatch, applyEdits, buildDisablePatch, zipStore, navIssues, navVerts, navGeometry,
   inflateZlib, parsePlugin, readHeader, resolveLoadOrder, newContext, decodeLand, extractEdges, compareEdges,
-  score, scoreParts, mainIssue, visible, VIS, analyzeWorld, findSeams, findWaterSeams, findFloating, pluginSummary, terrainWorlds,
+  zstr, score, scoreParts, mainIssue, visible, VIS, analyzeWorld, findSeams, findWaterSeams, findFloating, pluginSummary, terrainWorlds,
   texMixAt, surfaceSeams, textureHoles, textureOverflow, ownPatchOrder, ownBaseLost, ownEdgeLost, ownRebuilt, keyLabel, prettyWorld, DEFAULT_CHECKS, refEnabled, townLocation, gapReason, findIgnored, realColors, recolorWorld, pairMetricsDry, borderWater, maskUnderwater, texName, texCompareKey, heightAt, pairMetrics, waterLevel, OFFICIAL, decodeFull, texWeightsAt
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.TSI = api;
