@@ -1,6 +1,7 @@
-# Builds "Terrain Inspector.exe" on GitHub's Windows machines, with terrain-inspector.html built INTO it.
-# Needs, at the root of the repository: terrain-inspector.html, and the app/ folder.
-# The result is under Actions > the latest run > Artifacts > Terrain-Inspector-windows (a zip of the folder to upload to Nexus).
+# Builds the Windows version of Terrain Inspector on GitHub's Windows machines.
+# Needs, at the root of the repository: terrain-inspector.html, VERSION.txt (just the number, e.g. 2.5) and the app/ folder.
+# Result: Actions tab > latest "Build Windows exe" run > Artifacts > "Terrain Inspector <version>".
+# That download is the zip to upload to Nexus as it is: one plain folder, nothing packed inside the .exe.
 name: Build Windows exe
 
 on:
@@ -17,27 +18,40 @@ jobs:
         shell: bash
         run: test -f terrain-inspector.html || { echo "terrain-inspector.html is missing at the root of the repository"; exit 1; }
 
-      - name: Build the program (the tool page goes inside the .exe)
-        run: dotnet publish app/TerrainInspector.csproj -c Release -o out
-
-      - name: Add the read-me, if any, and remove build leftovers
+      - name: Work out the version
+        id: ver
         shell: bash
         run: |
-          if [ -f README.txt ]; then cp README.txt out/; fi
-          rm -f out/*.pdb out/*.xml
-          ls -la out
+          v=1.0.0; if [ -f VERSION.txt ]; then v=$(tr -d ' \r\n' < VERSION.txt); fi
+          n=$(echo "$v" | tr -cd '0-9.'); case "$n" in *.*.*) ;; *.*) n="$n.0" ;; *) n="$n.0.0" ;; esac
+          echo "v=$v" >> "$GITHUB_OUTPUT"; echo "n=$n" >> "$GITHUB_OUTPUT"
 
-      - name: Check that every file the program needs is there
+      - name: Build the program
+        run: dotnet publish app/TerrainInspector.csproj -c Release -o "out/Terrain Inspector" -p:TIVersion=${{ steps.ver.outputs.n }}
+
+      - name: Put the tool page next to the program, and the read-me
         shell: bash
         run: |
-          for f in "Terrain Inspector.exe" WebView2Loader.dll Microsoft.Web.WebView2.Core.dll Microsoft.Web.WebView2.WinForms.dll; do
-            test -f "out/$f" || { echo "missing: $f"; exit 1; }
+          d="out/Terrain Inspector"
+          mkdir -p "$d/page" && cp terrain-inspector.html "$d/page/terrain-inspector.html"
+          if [ -f README.txt ]; then cp README.txt "$d/"; fi
+          rm -f "$d/"*.pdb "$d/"*.xml
+          find "out" -type f | sort
+
+      - name: Check the folder is complete and plain
+        shell: bash
+        run: |
+          d="out/Terrain Inspector"
+          for f in "Terrain Inspector.exe" WebView2Loader.dll Microsoft.Web.WebView2.Core.dll Microsoft.Web.WebView2.WinForms.dll page/terrain-inspector.html; do
+            test -f "$d/$f" || { echo "missing: $f"; exit 1; }
           done
-          test ! -f out/terrain-inspector.html || { echo "the HTML should be inside the .exe, not next to it"; exit 1; }
-          # the .exe must be bigger than the page it carries
-          test $(stat -c %s "out/Terrain Inspector.exe") -gt $(stat -c %s terrain-inspector.html) || { echo "the tool page did not go into the .exe"; exit 1; }
+          # one program only, no archives inside, and the page is NOT inside the .exe (a small exe, the page beside it)
+          test $(find "$d" -iname '*.exe' | wc -l) -eq 1 || { echo "more than one .exe"; exit 1; }
+          test $(find "$d" -iregex '.*\.\(zip\|7z\|rar\|cab\|msi\)' | wc -l) -eq 0 || { echo "an archive ended up in the folder"; exit 1; }
+          test $(stat -c %s "$d/Terrain Inspector.exe") -lt 200000 || { echo "the .exe is too big: something got packed inside it"; exit 1; }
+          echo "OK: $(stat -c %s "$d/Terrain Inspector.exe") bytes"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: Terrain-Inspector-windows
+          name: Terrain Inspector ${{ steps.ver.outputs.v }}
           path: out
