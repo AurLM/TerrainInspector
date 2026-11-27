@@ -212,7 +212,9 @@ details.paste{margin-top:10px}details.paste summary{cursor:pointer;color:var(--d
 .v3-welcome .w-end{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;padding-top:12px;border-top:1px solid #2c313c;font-size:13.5px}
 .v3-welcome .w-ok{font-size:14.5px;padding:8px 20px}
 .reopen{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;margin:0 0 14px;padding-bottom:14px;border-bottom:1px solid #2c313c;font-size:12.5px}
-.patchbox{margin:0 0 10px}.navmods{margin-top:8px;font-size:12.5px}.navmods summary{cursor:pointer;color:#cfd6e4}.navmodlist{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto;margin:4px 0 6px;padding:4px 6px;background:#1a1e26;border-radius:6px}.navmodlist label{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;line-height:1.45;padding:1px 0}.navsel{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;margin-top:6px}.navsel label{cursor:pointer}.item.far{cursor:default;opacity:.85}.wfix{margin-left:auto;cursor:pointer;font-size:13px;white-space:nowrap}.patchbox ol li{margin:2px 0}
+.patchbox{margin:0 0 10px}
+.ptchip{display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:2px 8px;border:1px solid #3a4252;border-radius:12px;background:#1a1e26;color:#cfd6e4;cursor:pointer;white-space:nowrap;vertical-align:middle}.ptchip:hover{border-color:#e3a63c}.ptchip.sep{border-color:#e3a63c;color:#ffd38a}
+#ptPop{position:fixed;z-index:9999;width:330px;background:#151922;border:1px solid #3a4252;border-radius:10px;padding:12px 14px;box-shadow:0 10px 30px #000a;font-size:13px}#ptPop label{display:flex;gap:8px;align-items:flex-start;padding:4px 0;cursor:pointer}#ptPop input[type=text]{width:100%;margin-top:4px;box-sizing:border-box}#ptPop .muted{font-size:12px}.navmods{margin-top:8px;font-size:12.5px}.navmods summary{cursor:pointer;color:#cfd6e4}.navmodlist{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto;margin:4px 0 6px;padding:4px 6px;background:#1a1e26;border-radius:6px}.navmodlist label{cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0;line-height:1.45;padding:1px 0}.navsel{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12.5px;margin-top:6px}.navsel label{cursor:pointer}.item.far{cursor:default;opacity:.85}.wfix{margin-left:auto;cursor:pointer;font-size:13px;white-space:nowrap}.patchbox ol li{margin:2px 0}
 .newpill{background:#ff5a4d;color:#fff;font-size:10px;font-weight:700;border-radius:4px;padding:1px 5px}.rundiff{font-size:12.5px;margin:0 0 8px;padding:6px 9px;border:1px solid #333a48;border-radius:8px}.rundiff details{margin-top:4px}
 .ptabs{display:flex;gap:6px;margin-bottom:8px}.ptab{flex:1;padding:7px 8px;font-weight:600;border-radius:8px}.ptab.on{background:#2a2f3a;border-color:#59627a}.ptab.ign.on{background:#3a3210;border-color:#c9a227;color:#ffe08a}
 .wgroup{margin:10px 0 4px}.whead{font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:7px}.wdot{width:10px;height:10px;border-radius:50%;display:inline-block}
@@ -504,6 +506,35 @@ const NAMEBASE = 16777216;
    UTF-8 when it is valid UTF-8 (which Windows-1252/1251 text with accents practically never is), otherwise as Windows-1251 when
    it is mostly letters from the upper half (a Cyrillic word), otherwise as Windows-1252. */
 let decUtf8, dec1252, dec1251;
+/* Patches made by this tool. The combined ones (one ground patch, one objects patch) take in everything made before, so each
+   new one replaces the last. A separate patch ("[Separate: Lakeview Manor] …" at the start of its description) only holds what
+   was made for it: the combined ones leave it alone, and it can be switched off on its own. While a separate patch is being made,
+   SEP holds its name: that patch, and no other, is then "ours" (taken in and replaced). */
+let SEP = null;
+function toolKind(hdr) {
+  const mine = hdr.author === 'Terrain Inspector', m = mine && /^\[Separate: ([^\]]*)\] /.exec(hdr.desc || ''), body = m ? hdr.desc.slice(m[0].length) : (hdr.desc || '');
+  const toolGround = mine && /^Ground patch:/.test(body), toolObj = mine && /^Switches off/.test(body), sepName = m ? m[1] : null;
+  return { toolGround, toolObj, toolNav: mine && /^Navmesh patch/.test(body), sepName,
+    ownGround: toolGround && !sepName,     // an earlier combined ground patch made by this tool
+    ownDisable: toolObj && !sepName };     // an earlier combined objects patch (disabled / moved) made by this tool
+}
+/* Runs a patch build as a separate patch called name (or as the combined one when name is empty). */
+function asSeparate(ctx, name, fn) {
+  name = (name || '').trim() || null;
+  const saved = ctx.plugins.map(P => [P.ownGround, P.ownDisable]);
+  SEP = name;
+  for (const P of ctx.plugins) { P.ownGround = P.toolGround && (P.sepName || null) === name; P.ownDisable = P.toolObj && (P.sepName || null) === name; }
+  const done = () => { SEP = null; ctx.plugins.forEach((P, i) => { if (saved[i]) { P.ownGround = saved[i][0]; P.ownDisable = saved[i][1]; } }); };
+  let r; try { r = fn(); } catch (e) { done(); throw e; }
+  if (r && typeof r.then === 'function') return r.finally(done);
+  done(); return r;
+}
+/* The separate patches in the load order: name -> the plugin files that belong to it. */
+function separatePatches(ctx) {
+  const m = new Map();
+  for (const P of ctx.plugins) if (P.sepName && (P.toolGround || P.toolObj || P.toolNav)) { if (!m.has(P.sepName)) m.set(P.sepName, []); m.get(P.sepName).push(P.name); }
+  return m;
+}
 function zstr(u8, s, e) {
   let end = s, high = 0, ascL = 0;
   while (end < e && u8[end] !== 0) { const c = u8[end]; if (c >= 128) high++; else if ((c | 32) >= 97 && (c | 32) <= 122) ascL++; end++; }
@@ -540,6 +571,7 @@ function newContext(opts) {
     baseInfo: new Map(),    // baseKey -> {t, edid, model}
     ltex: new Map(),        // ltexKey -> {edid, txst, grass: [grasKey]}
     cellRawVers: new Map(), worldRawVers: new Map(),
+    sepHidden: new Map(),   // the same, per separate objects patch: name -> Map(key -> {…})
     ownHidden: new Map(),   // objects an earlier objects patch of this tool switched off (keep: false) or moved (keep: true), still winning: key -> {p, off, w, cell, pers, keep}   // every CELL / WRLD record version, for patches made for some mods only
     weathers: new Map(),    // wthrKey -> {edid, colors[type][time] = [r,g,b], fog:[dayNear,dayFar,nightNear,nightFar], flags}
     climates: new Map(),    // clmtKey -> {edid, weathers:[{key, chance}], times:[sunriseBegin, sunriseEnd, sunsetBegin, sunsetEnd] (hours)}
@@ -626,8 +658,7 @@ function parsePlugin(ctx, name, buf, loadIndex) {
     lmasters: new Set(hdr.masters.map(m => m.toLowerCase())),
     masterG: hdr.masters.map(m => nameIndex(ctx, m)), selfG: nameIndex(ctx, name),
     isESM: hdr.isESM, isESL: hdr.isESL || lname.endsWith('.esl'), baseline: isBaselineName(ctx, lname), localized: hdr.isLocalized,
-    ownGround: hdr.author === 'Terrain Inspector' && /^Ground patch:/.test(hdr.desc),   // an earlier ground patch made by this tool
-    ownDisable: hdr.author === 'Terrain Inspector' && /^Switches off/.test(hdr.desc),     // an earlier objects patch (disabled / moved) made by this tool
+    ...toolKind(hdr),
     counts: { lands: 0, cells: 0, refs: 0 }
   };
   ctx.plugins.push(p);
@@ -728,8 +759,12 @@ function parsePlugin(ctx, name, buf, loadIndex) {
     if (type === TY.REFR) {
       if (world == null || !ctx.opts.refs) return;
       const key = resolve(p, raw);
-      if (flags & FLAG_DELETED) { ctx.refs.delete(key); ctx.disabled.add(key); ctx.enableParent.delete(key); ctx.ownHidden.delete(key); return; }
+      if (flags & FLAG_DELETED) { ctx.refs.delete(key); ctx.disabled.add(key); ctx.enableParent.delete(key); ctx.ownHidden.delete(key); for (const o of ctx.sepHidden.values()) o.delete(key); return; }
       if (p.ownDisable) ctx.ownHidden.set(key, { p: p.idx, off, w: world, cell, pers: childType === 8, keep: !(flags & FLAG_DISABLED) }); else ctx.ownHidden.delete(key);
+      if (ctx.sepHidden.size || (p.toolObj && p.sepName)) {
+        for (const [n, o] of ctx.sepHidden) if (n !== p.sepName || !p.toolObj) o.delete(key);
+        if (p.toolObj && p.sepName) { let o = ctx.sepHidden.get(p.sepName); if (!o) ctx.sepHidden.set(p.sepName, o = new Map()); o.set(key, { p: p.idx, off, w: world, cell, pers: childType === 8, keep: !(flags & FLAG_DISABLED) }); }
+      }
       if (flags & FLAG_DISABLED) ctx.disabled.add(key); else ctx.disabled.delete(key);
       const b = recordBody(u8, dv, off, size, flags);
       let base = -1, x = 0, y = 0, z = 0, rx = 0, ry = 0, rz = 0, sc = 1, hasPos = false, ep = null;
@@ -1996,7 +2031,7 @@ function patchWriter(ctx, seed) {
   const tes4 = text => {
     const z = t => enc.encode(t + '\0');
     const hedr = new Uint8Array(12), hv = new DataView(hedr.buffer); hv.setFloat32(0, 1.71, true); hv.setUint32(4, count, true); hv.setUint32(8, 0x800, true);
-    const hparts = [sub(T('HEDR'), hedr), sub(T('CNAM'), z('Terrain Inspector')), sub(T('SNAM'), z(text))];
+    const hparts = [sub(T('HEDR'), hedr), sub(T('CNAM'), z('Terrain Inspector')), sub(T('SNAM'), z((SEP ? `[Separate: ${SEP}] ` : '') + text))];
     for (const m of masters) hparts.push(sub(T('MAST'), z(m)), sub(T('DATA'), new Uint8Array(8)));
     return rec(T('TES4'), 0x200, 0, null, cat(hparts));
   };
@@ -2090,7 +2125,7 @@ function refrRenumbered(P, b, fix) {
 async function buildDisablePatch(ctx, items, readRec) {
   // objects an earlier objects patch of this tool switched off or moved are carried in, so the new plugin replaces them all
   const have = new Set(items.map(it => it.key)), carried = [];
-  for (const [key, r] of ctx.ownHidden) if (!have.has(key)) carried.push({ key, r, carried: true, keep: r.keep });
+  for (const [key, r] of (SEP ? ctx.sepHidden.get(SEP) || new Map() : ctx.ownHidden)) if (!have.has(key)) carried.push({ key, r, carried: true, keep: r.keep });
   items = items.concat(carried);
   const replaces = [...new Set(carried.map(it => ctx.plugins[it.r.p].name))];
   const res = await disableBoth(ctx, items, readRec);
@@ -2157,7 +2192,7 @@ async function disableOne(ctx, items, readRec) {
   const last = fin.from.slice().sort((a, b) => at(a) - at(b)).pop();
   const nMoved = ready.filter(x => !fin.left.includes(x.it) && (x.it.move || x.it.keep)).length;
   const head = fin.Wr.tes4(`Switches off ${fin.done - nMoved} object(s)${nMoved ? ` and moves ${nMoved} object(s)` : ''} picked in Terrain Inspector, placed by: ${fin.from.join(', ')}. Load after all of them. Make it again if your load order changes.`);
-  return { file: { name: 'Terrain Inspector - Disabled objects.esp', bytes: fin.Wr.cat([head, fin.body]), count: fin.done, moved: nMoved, from: last, fromAll: fin.from }, rest: fin.left, skipped };
+  return { file: { name: `Terrain Inspector - Disabled objects${SEP ? ' - ' + SEP : ''}.esp`, bytes: fin.Wr.cat([head, fin.body]), count: fin.done, moved: nMoved, from: last, fromAll: fin.from, masters: fin.Wr.masters }, rest: fin.left, skipped };
 }
 async function disablePerMod(ctx, items, readRec) {
   const byP = new Map(), skipped = [];
@@ -2202,7 +2237,7 @@ async function disablePerMod(ctx, items, readRec) {
     }
     const top = grup(T('WRLD'), 0, tops);
     const head = Wr.tes4(`Switches off ${done} object(s) placed by ${src}, picked in Terrain Inspector. Load after that plugin. Make it again if your load order changes.`);
-    files.push({ name: `Terrain Inspector - Disabled objects - ${src.replace(/\.es[mpl]$/i, '')}.esp`, bytes: cat([head, top]), count: done, from: src });
+    files.push({ name: `Terrain Inspector - Disabled objects - ${SEP ? SEP + ' - ' : ''}${src.replace(/\.es[mpl]$/i, '')}.esp`, bytes: cat([head, top]), count: done, from: src, masters: Wr.masters });
   }
   return { files, skipped };
 }
@@ -3138,7 +3173,7 @@ const api = {
   navHealth, navCalibrate, buildNavPatch, nvnmParse, navParse,
   isCityWorld, buildSeamPatch, applyEdits, buildDisablePatch, zipStore, navIssues, navVerts, navGeometry,
   inflateZlib, parsePlugin, readHeader, resolveLoadOrder, newContext, decodeLand, extractEdges, compareEdges,
-  zstr, score, scoreParts, mainIssue, visible, VIS, analyzeWorld, findSeams, findWaterSeams, findFloating, pluginSummary, terrainWorlds,
+  zstr, asSeparate, separatePatches, score, scoreParts, mainIssue, visible, VIS, analyzeWorld, findSeams, findWaterSeams, findFloating, pluginSummary, terrainWorlds,
   texMixAt, surfaceSeams, textureHoles, textureOverflow, ownPatchOrder, ownBaseLost, ownEdgeLost, ownRebuilt, keyLabel, prettyWorld, DEFAULT_CHECKS, refEnabled, townLocation, gapReason, findIgnored, realColors, recolorWorld, pairMetricsDry, borderWater, maskUnderwater, texName, texCompareKey, heightAt, pairMetrics, waterLevel, OFFICIAL, decodeFull, texWeightsAt
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.TSI = api;
@@ -5987,7 +6022,7 @@ function createView3D(host, deps) {
     const bar = q('.v3-terbar'), n = deps.terraCount ? deps.terraCount() : 0;
     blendLines();
     bar.style.display = n ? '' : 'none';
-    bar.innerHTML = n ? `<b>${n}</b> ground edit${n > 1 ? 's' : ''} <button class="small primary v3-mkter" title="Downloads the patch with these ground edits (and the seam fixes).">🛠 Create patch</button> <button class="small v3-unter" title="Take back the last brush click">↶ Undo</button>` : '';
+    bar.innerHTML = n ? `<b>${n}</b> ground edit${n > 1 ? 's' : ''} <button class="small primary v3-mkter" title="Downloads the patch with these ground edits (and the seam fixes).">🛠 Create patch</button> ${deps.ptChip ? deps.ptChip() : ''} <button class="small v3-unter" title="Take back the last brush click">↶ Undo</button>` : '';
     if (n) {
       q('.v3-mkter').onclick = () => { const pan = q('.v3-gpanel'); pan.style.display = 'block'; pan.innerHTML = closeBtn + deps.terraPatch(); wireClose(); };
       q('.v3-unter').onclick = () => terraShow(deps.terraUndo());
@@ -6063,7 +6098,7 @@ function createView3D(host, deps) {
   function refreshHidden(rebuild = true) {
     const bar = q('.v3-hidbar'), n = deps.hiddenRefs ? deps.hiddenRefs().size : 0, nm = deps.movedRefs ? [...deps.movedRefs().keys()].filter(k => !deps.hiddenRefs().has(k)).length : 0;
     bar.style.display = n || nm ? '' : 'none';
-    bar.innerHTML = n || nm ? `${n ? `<b>${n}</b> object${n > 1 ? 's' : ''} disabled` : ''}${n && nm ? ' · ' : ''}${nm ? `<b>${nm}</b> moved` : ''} <button class="small primary v3-mkdis" title="Downloads a small plugin that switches these objects off in game. Your load order and the original mods are not changed.">🛠 Create patch</button> <button class="small v3-undis" title="Undo the last change">↶ Undo</button>` : '';
+    bar.innerHTML = n || nm ? `${n ? `<b>${n}</b> object${n > 1 ? 's' : ''} disabled` : ''}${n && nm ? ' · ' : ''}${nm ? `<b>${nm}</b> moved` : ''} <button class="small primary v3-mkdis" title="Downloads a small plugin that switches these objects off in game. Your load order and the original mods are not changed.">🛠 Create patch</button> ${deps.ptChip ? deps.ptChip() : ''} <button class="small v3-undis" title="Undo the last change">↶ Undo</button>` : '';
     if (n || nm) {
       q('.v3-mkdis').onclick = async () => { const pan = q('.v3-gpanel'); pan.style.display = 'block'; pan.innerHTML = 'Making the patch…'; pan.innerHTML = closeBtn + await deps.makeDisablePatch(); wireClose(); };
       q('.v3-undis').onclick = () => { deps.unhideLast(); refreshHidden(); };
@@ -6376,6 +6411,7 @@ const fmt = n => Math.round(n).toLocaleString('en-US');
 
 /* ---------------- state ---------------- */
 const S = {
+  ptName: '',            // '' = new patches go into the one combined patch; otherwise the name of a separate patch
   files: new Map(),      // lname -> File (last picked wins)
   handles: [], loHandles: [], nav: [], runDiff: null, hidden: new Map(), moved: new Map(), objUndo: [], pv: null, navH: null, navSel: { del: true, link: true, snap: true }, navMsg: null, terra: { w: null, m: new Map(), undo: [] }, patchExtra: { w: null, m: new Map() },
   cands: new Map(), meshState: new Map(), cover: new Map(), cityStatus: new Map(), worldCache: new Map(), bgToken: 0, bgText: '', badges: [], looseCands: new Map(), bsaCands: [], lazySources: [], assets: null, texRGB: new Map(), texReady: false, profiles: new Map(), profile: null, modlist: null, modlistName: '', dupInfo: null,
@@ -7867,6 +7903,7 @@ const V3 = createView3D($('#view3d'), {
   texStroke: st => { const t = terra(); t.s.push(st); t.undo.push({ stroke: true }); renderPane(); return blendView(); },
   texAt: (x, y) => TSI.texMixAt(S.ctx, S.W, x, y).map(([k, w]) => [k, w, TSI.texName(S.ctx, k)]),
   terraPatch: () => makeSeamPatch(),
+  ptChip: () => ptChip(),
   terraOnly: () => new Map(withTerra(null) || []),
   insideCity: () => !!S.W3,
   hiddenRefs: () => S.hidden,
@@ -7966,6 +8003,56 @@ function patchPreview() {
   S.patchPv = { w: W, seams: S.seams, sig, map };
   return map;
 }
+/* ---------------- which patch a new patch goes into ---------------- */
+// Combined (default): one ground patch and one objects patch that take in everything made before, so each new one replaces the last.
+// Separate: a patch with its own name (a player home, a mod you may remove later) holding only what is made while it is picked.
+// The same choice applies to ground, objects and navmesh patches, so one place can get its three patches under one name.
+const ptClean = s => String(s || '').replace(/[^\p{L}\p{N} '&().,+-]/gu, '').replace(/\s+/g, ' ').trim().slice(0, 40);
+function ptChip() {
+  return `<span class="ptchip${S.ptName ? ' sep' : ''}" data-ptchip title="Which patch this goes into: your one combined patch, or a separate one you can switch off on its own">📦 ${S.ptName ? 'Separate: ' + esc(S.ptName) : 'Combined patch'} ▾</span>`;
+}
+function ptRefresh() { document.querySelectorAll('[data-ptchip]').forEach(el => { el.outerHTML = ptChip(); }); }
+function ptOpen(anchor) {
+  let pop = $('#ptPop'); if (pop) { pop.remove(); return; }
+  const have = S.ctx ? [...TSI.separatePatches(S.ctx).keys()] : [];
+  if (S.ptName && !have.includes(S.ptName)) have.push(S.ptName);
+  pop = document.createElement('div'); pop.id = 'ptPop';
+  pop.innerHTML = `<b>Patches go into…</b>
+    <label><input type="radio" name="pt" value=""${S.ptName ? '' : ' checked'}><span><b>One combined patch</b> <span class="muted">(recommended)</span><br><span class="muted">Each new patch also holds your earlier fixes, so you keep a single plugin.</span></span></label>
+    ${have.map(n => `<label><input type="radio" name="pt" value="${esc(n)}"${S.ptName === n ? ' checked' : ''}><span><b>Separate: ${esc(n)}</b><br><span class="muted">Updates that patch: it keeps what it held and adds the new fixes.</span></span></label>`).join('')}
+    <label><input type="radio" name="pt" value="+"><span><b>New separate patch</b><br><span class="muted">Only what you make while it is picked, in its own plugin: switch it off later without losing your other fixes (a player home, a mod you are trying).</span><input type="text" id="ptNew" placeholder="Name, e.g. Lakeview Manor" maxlength="40"></span></label>
+    <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:6px"><button class="small" id="ptCancel">Cancel</button><button class="small primary" id="ptOk">OK</button></div>`;
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect(), H = pop.offsetHeight;
+  pop.style.left = Math.max(8, Math.min(innerWidth - 340, r.left)) + 'px';
+  pop.style.top = (r.bottom + 6 + H < innerHeight ? r.bottom + 6 : Math.max(8, r.top - 6 - H)) + 'px';
+  const nw = $('#ptNew');
+  nw.oninput = () => { pop.querySelector('input[value="+"]').checked = true; };
+  nw.onkeydown = e => { if (e.key === 'Enter') $('#ptOk').click(); };
+  $('#ptCancel').onclick = () => pop.remove();
+  $('#ptOk').onclick = () => {
+    const pick = pop.querySelector('input[name=pt]:checked').value;
+    if (pick === '+') { const n = ptClean(nw.value); if (!n) { nw.focus(); nw.style.borderColor = '#e05252'; return; } S.ptName = n; }
+    else S.ptName = pick;
+    pop.remove(); ptRefresh();
+  };
+}
+document.addEventListener('click', e => {
+  const chip = e.target.closest && e.target.closest('[data-ptchip]');
+  if (chip) { e.preventDefault(); e.stopPropagation(); ptOpen(chip); return; }
+  const pop = $('#ptPop'); if (pop && !pop.contains(e.target)) pop.remove();
+}, true);
+const ptFile = () => S.ptName ? ' - ' + S.ptName : '';
+// tool patches of ANOTHER group the new patch needs as masters (it changes cells they also hold)
+function ptDeps(masters) {
+  const ml = new Set((masters || []).map(m => m.toLowerCase()));
+  return S.ctx.plugins.filter(P => ml.has(P.lname) && (P.toolGround || P.toolObj || P.toolNav) && (P.sepName || '') !== (S.ptName || '')).map(P => P.name);
+}
+function ptNote(masters) {
+  const dep = ptDeps(masters);
+  return (S.ptName ? `<li><b>Separate patch "${esc(S.ptName)}":</b> it holds only what you made for it. Your combined patch is not touched: keep both. To undo these fixes later, just switch this one off.</li>` : '') +
+    (dep.length ? `<li><b>It builds on ${dep.map(esc).join(', ')}</b> (also made by this tool), because both change the same cells: keep ${dep.length > 1 ? 'them' : 'it'} and load this one after.</li>` : '');
+}
 // Every patch is handed over as a .zip: Vortex only installs archives ("Install From File" on a bare .esp fails
 // with "Archive damaged"), and MO2 installs a .zip the same way.
 function savePatch(files, zipName) {
@@ -7978,14 +8065,14 @@ const INST = '<li>Install the .zip like any mod (MO2: Install a new mod from arc
 function makeSeamPatch() {
   const W = S.W, list = patchList();
   const ed = terraEdits();
-  let r; try { r = TSI.buildSeamPatch(S.ctx, W, list, ed, blendEdges(), texStrokes(), fillList(), ovfPicked(), waterPicked()); } catch (e) { r = { bytes: null, error: e.message || String(e), failed: [], left: [] }; }
-  const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), name = `Terrain Inspector - Seam Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}.esp`;
+  let r; try { r = TSI.asSeparate(S.ctx, S.ptName, () => TSI.buildSeamPatch(S.ctx, W, list, ed, blendEdges(), texStrokes(), fillList(), ovfPicked(), waterPicked())); } catch (e) { r = { bytes: null, error: e.message || String(e), failed: [], left: [] }; }
+  const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), name = `Terrain Inspector - Seam Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}${ptFile()}.esp`;
   let hmsg;
   if (!r.bytes) hmsg = `<div class="errbox" style="margin-top:8px">No patch could be made${r.error ? ` (${esc(r.error)})` : ': the ground is too steep at these borders'}.</div>`;
   else {
     savePatch([{ name, bytes: r.bytes }], zipOf(name));
     const skipped = list.length - r.fixed;
-    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.filled ? `lost textures put back in ${r.filled} cell${r.filled === 1 ? '' : 's'}, ` : ''}${r.overflowed ? `${r.overflowed} cell${r.overflowed === 1 ? '' : 's'} brought back to 6 textures, ` : ''}${r.rebased ? `${r.rebased} base texture${r.rebased === 1 ? '' : 's'} put back, ` : ''}${r.relaid ? `${r.relaid} quarter${r.relaid === 1 ? '' : 's'} back to their original layout, ` : ''}${r.watered ? `${r.watered} water level${r.watered === 1 ? '' : 's'} matched, ` : ''}${r.reedged ? `${r.reedged} quarter-edge point${r.reedged === 1 ? '' : 's'} restored, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}${r.texHeld ? `. ${r.texHeld} quarter-cell${r.texHeld === 1 ? '' : 's'} kept ${r.texHeld === 1 ? 'its' : 'their'} original textures: the new mix could not be stored exactly there (too many textures), so the tool left ${r.texHeld === 1 ? 'it' : 'them'} as ${r.texHeld === 1 ? 'it was' : 'they were'} instead of risking a visible patch` : ''}.<ol style="margin:6px 0 0 18px;padding:0">${r.replaces && r.replaces.length ? `<li><b>It also holds everything from your earlier ${r.replaces.map(esc).join(', ')}</b> (${r.carried} cell${r.carried === 1 ? '' : 's'} carried over), so it <b>replaces</b> ${r.replaces.length > 1 ? 'them' : 'it'}: install it over the old one (MO2: same name → Replace) or switch the old one off. Keep only one.</li>` : ''}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
+    hmsg = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${list.length ? `${r.fixed} of ${list.length} border${list.length === 1 ? '' : 's'} closed, ` : ''}${r.editCells ? `${r.editCells} cell${r.editCells === 1 ? '' : 's'} reshaped by hand${r.editBad ? ` (${r.editBad} too steep, left out)` : ''}, ` : ''}${r.blended ? `textures blended across ${r.blended} border${r.blended === 1 ? '' : 's'}, ` : ''}${r.painted ? `${r.painted} texture brush stroke${r.painted === 1 ? '' : 's'}, ` : ''}${r.filled ? `lost textures put back in ${r.filled} cell${r.filled === 1 ? '' : 's'}, ` : ''}${r.overflowed ? `${r.overflowed} cell${r.overflowed === 1 ? '' : 's'} brought back to 6 textures, ` : ''}${r.rebased ? `${r.rebased} base texture${r.rebased === 1 ? '' : 's'} put back, ` : ''}${r.relaid ? `${r.relaid} quarter${r.relaid === 1 ? '' : 's'} back to their original layout, ` : ''}${r.watered ? `${r.watered} water level${r.watered === 1 ? '' : 's'} matched, ` : ''}${r.reedged ? `${r.reedged} quarter-edge point${r.reedged === 1 ? '' : 's'} restored, ` : ''}${r.cells} cells changed${skipped ? `, ${skipped} skipped (too steep to blend, or not real ground)` : ''}${r.texHeld ? `. ${r.texHeld} quarter-cell${r.texHeld === 1 ? '' : 's'} kept ${r.texHeld === 1 ? 'its' : 'their'} original textures: the new mix could not be stored exactly there (too many textures), so the tool left ${r.texHeld === 1 ? 'it' : 'them'} as ${r.texHeld === 1 ? 'it was' : 'they were'} instead of risking a visible patch` : ''}.<ol style="margin:6px 0 0 18px;padding:0">${ptNote(r.masters)}${r.replaces && r.replaces.length ? `<li><b>It also holds everything from your earlier ${r.replaces.map(esc).join(', ')}</b> ${r.carried ? `(${r.carried} cell${r.carried === 1 ? '' : 's'} carried over)` : ''}, so it <b>replaces</b> ${r.replaces.length > 1 ? 'them' : 'it'}: install it over the old one (MO2: same name → Replace) or switch the old one off. Keep only one.</li>` : ''}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li><li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that changes this ground). It does not have to be last: map, LOD and other end-of-list plugins can stay below it. ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again to check: the seams should show as fixed.</li></ol><div class="muted" style="margin-top:6px">It moves the ground and blends the ground textures near those borders (objects are not moved). Make a new one whenever your load order changes. New feature: look at the spots in game.</div></div>`;
   }
   S.patchMsg = { w: W, h: hmsg };
   return hmsg;
@@ -8062,19 +8149,19 @@ function navFiltered() {
 async function makeNavPatch() {
   const W = S.W, F = navFiltered(), sel = S.navSel;
   const plan = { restore: sel.del ? F.del.filter(d => d.fixable) : [], pairs: sel.link ? F.pairs : [], snap: sel.snap && F.nav.length ? F.nav : false, only: F.mods ? new Set([...F.mods].filter(p => p !== NAV_BASE)) : null };
-  let r; try { r = await TSI.buildNavPatch(S.ctx, W, plan, readRec); } catch (e) { r = { bytes: null, error: e.message || String(e), skipped: [] }; }
+  let r; try { r = await TSI.asSeparate(S.ctx, S.ptName, () => TSI.buildNavPatch(S.ctx, W, plan, readRec)); } catch (e) { r = { bytes: null, error: e.message || String(e), skipped: [] }; }
   const why = r.skipped && r.skipped.length ? [...new Set(r.skipped.map(x => x.why))].slice(0, 3).join('; ') : '';
   let h;
   if (!r.bytes) h = `<div class="errbox" style="margin-top:8px">No navmesh patch could be made${r.error ? ` (${esc(r.error)})` : why ? `: ${esc(why)}` : ': nothing here can be corrected safely'}.</div>`;
   else {
     const wn = TSI.prettyWorld(W.world.edid).replace(/[^\w -]/g, ''), one = F.mods && F.mods.size === 1 ? navModName([...F.mods][0]).replace(/\.es[pml]$/i, '').replace(/[^\w -]/g, '').slice(0, 60) : '';
-    const name = `Terrain Inspector - Navmesh Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}${one ? ' - ' + one : F.mods ? ` - ${F.mods.size} mods` : ''}.esp`, c = r.count;
+    const name = S.ptName ? `Terrain Inspector - Navmesh Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}${ptFile()}.esp` : `Terrain Inspector - Navmesh Patch${wn && wn !== 'Tamriel' ? ' - ' + wn : ''}${one ? ' - ' + one : F.mods ? ` - ${F.mods.size} mods` : ''}.esp`, c = r.count;
     savePatch([{ name, bytes: r.bytes }], zipOf(name));
     const did = [c.restored && `${c.restored} deleted navmesh${c.restored > 1 ? 'es' : ''} brought back and parked below the ground`,
       c.relinked && `${c.relinked} navmesh${c.relinked > 1 ? 'es' : ''} re-linked (${[c.fixed && c.fixed + ' links corrected', c.added && c.added + ' added', c.cut && c.cut + (c.cut > 1 ? ' dead ones cut' : ' dead one cut')].filter(Boolean).join(', ')})`,
       c.snapped && `${c.snapped} put back on the ground`].filter(Boolean).join('; ');
     h = `<div class="okbox" style="margin-top:8px"><b>${esc(zipOf(name))}</b> downloaded: ${did}${r.skipped.length ? `. ${r.skipped.length} left out (${esc(why)})` : ''}${c.held ? `. ${c.held} neighbouring navmesh${c.held > 1 ? 'es' : ''} from mods you did not pick ${c.held > 1 ? 'were' : 'was'} left as ${c.held > 1 ? 'they are' : 'it is'}: their side gets fixed in their own patch` : ''}.
-      <ol style="margin:6px 0 0 18px;padding:0"><li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li>${F.mods ? `<li>Put it <b>right after ${esc([...F.mods].filter(p => p !== NAV_BASE).concat(S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)).sort((a, b) => b - a).map(i => P(i).name)[0] || r.after)}</b>, <b>not at the end</b>: it only depends on the mods you picked and the game, and holds their cells as those mods left them, so your later mods' cell changes (water, lighting…) must still load after it.` : `<li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes).`} ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
+      <ol style="margin:6px 0 0 18px;padding:0">${ptNote(r.masters)}<li>Install the .zip like any mod (MO2: Install a new mod from archive; Vortex: Install From File) and enable it.</li>${F.mods ? `<li>Put it <b>right after ${esc([...F.mods].filter(p => p !== NAV_BASE).concat(S.ctx.plugins.filter(p => p.name === r.after).map(p => p.idx)).sort((a, b) => b - a).map(i => P(i).name)[0] || r.after)}</b>, <b>not at the end</b>: it only depends on the mods you picked and the game, and holds their cells as those mods left them, so your later mods' cell changes (water, lighting…) must still load after it.` : `<li>Put it anywhere <b>after ${esc(r.after)}</b> (the last plugin that touches these navmeshes).`} ESL-flagged, so it takes no plugin slot.</li><li>Run the tool again: these lines should be gone.${F.mods ? ' This patch only covers the mods you picked, so you can keep it as \'done\' for them. Make the next one after installing this one: it builds on it.' : ''}</li></ol>
       <div class="muted" style="margin-top:6px">This is the tool's newest and least proven kind of patch. Go to one of these places in game and watch an NPC or follower walk there before you keep it. Removing the plugin undoes everything. Make a new one when your load order changes.</div></div>`;
   }
   S.navMsg = { w: W, h };
@@ -8082,14 +8169,14 @@ async function makeNavPatch() {
 }
 async function makeDisablePatch() {
   const items = [...S.hidden.values(), ...[...S.moved.values()].filter(m => !S.hidden.has(m.key)).map(m => ({ key: m.key, r: m.r, move: { dx: m.dx, dy: m.dy, dz: m.dz } }))];
-  let r; try { r = await TSI.buildDisablePatch(S.ctx, items, readRec); } catch (e) { return `<div class="errbox">No patch could be made (${esc(e.message || String(e))}).</div>`; }
+  let r; try { r = await TSI.asSeparate(S.ctx, S.ptName, () => TSI.buildDisablePatch(S.ctx, items, readRec)); } catch (e) { return `<div class="errbox">No patch could be made (${esc(e.message || String(e))}).</div>`; }
   if (!r.files.length) return `<div class="errbox">No patch could be made: these objects' records couldn't be read back from your plugins.</div>`;
-  const one = r.files.length === 1, name = savePatch(r.files, one ? zipOf(r.files[0].name) : 'Terrain Inspector - Disabled objects.zip');
+  const one = r.files.length === 1, name = savePatch(r.files, one ? zipOf(r.files[0].name) : `Terrain Inspector - Disabled objects${ptFile()}.zip`);
   const n = r.files.reduce((t, f) => t + f.count, 0), nm = r.files.reduce((t, f) => t + (f.moved || 0), 0), off = n - nm;
   return `<div class="okbox"><b>${esc(name)}</b> downloaded: ${[off && `${off} object${off > 1 ? 's' : ''} switched off`, nm && `${nm} moved`].filter(Boolean).join(', ')}${r.skipped.length ? `, ${r.skipped.length} skipped (record not readable)` : ''}.` +
     (r.replaces && r.replaces.length ? `<div style="margin-top:4px"><b>It also holds the ${r.carried} object${r.carried === 1 ? '' : 's'} of your earlier ${r.replaces.map(esc).join(', ')}</b>, so it replaces ${r.replaces.length > 1 ? 'them' : 'it'}: once this one is installed, switch the old one${r.replaces.length > 1 ? 's' : ''} off. Keep only these.</div>` : '') +
     (one ? '' : `<div style="margin-top:4px">It holds ${r.files.length} plugins: the main one, plus a small one per mod for objects whose data could not be merged (${r.files.slice(1).map(f => esc(f.from)).join(', ')}).</div>`) +
-    `<ol style="margin:6px 0 0 18px;padding:0">${INST}` +
+    `<ol style="margin:6px 0 0 18px;padding:0">${ptNote([...new Set(r.files.flatMap(f => f.masters || []))])}${INST}` +
     `<li><b>Load order matters here:</b> in your plugin list, put the patch <b>below ${esc(r.files[0].from)}</b>${one ? '' : ` (${r.files.length - 1 > 1 ? 'the extra plugins named after a mod go' : 'the extra plugin named after a mod goes'} below that mod: those objects carry data that could not be merged)`}. That is the last plugin that touches these objects: any plugin under the patch that also edits them wins, and the objects come back. ESL-flagged: no plugin slot used.</li>` +
     `<li><b>Check it here:</b> load your list in this tool again. The objects should be gone from the 3D view. If they are still there, a plugin below the patch overrides them: move the patch lower.</li>` +
     `<li>To bring objects back, remove the plugin.</li></ol>` +
@@ -8198,7 +8285,7 @@ function renderPane() {
     const sel = S.navSel, fixDel = NH ? F.del.filter(d => d.fixable).length : 0, cal = NH ? NH.cal : null;
     const nFix = (sel.del ? fixDel : 0) + (sel.link ? F.pairs.length : 0) + (sel.snap ? F.nav.length : 0), pc = (a, b) => b ? Math.round(a / b * 100) + '%' : 'n/a';
     h += `<p class="muted" style="font-size:12.5px;margin:6px 0 8px">NPCs and followers walk on an invisible path mesh (navmesh). This tab lists what mods broke in it. Click a line to see the place in 3D.</p>`;
-    h += `<div class="patchbox"><button class="primary small" id="mkNav" ${nFix ? '' : 'disabled'} title="A small plugin that corrects the ticked problems. It only holds those navmeshes: your mods and load order are not touched.">🛠 Create a navmesh patch</button>
+    h += `<div class="patchbox"><button class="primary small" id="mkNav" ${nFix ? '' : 'disabled'} title="A small plugin that corrects the ticked problems. It only holds those navmeshes: your mods and load order are not touched.">🛠 Create a navmesh patch</button> ${ptChip()}
       <div class="navsel">${fixDel ? `<label><input type="checkbox" data-ns="del" ${sel.del ? 'checked' : ''}> ${fixDel} deleted</label>` : ''}${F.pairs.length ? `<label><input type="checkbox" data-ns="link" ${sel.link ? 'checked' : ''}> ${F.pairs.length} broken link${F.pairs.length > 1 ? 's' : ''}</label>` : ''}${F.nav.length ? `<label><input type="checkbox" data-ns="snap" ${sel.snap ? 'checked' : ''}> ${F.nav.length} off the ground</label>` : ''}</div>
       ${(() => {      // a patch for some mods only
         const cnt = new Map(), add = (k, x) => { for (const p of new Set(navMods(k, x))) cnt.set(p, (cnt.get(p) || 0) + 1); };
@@ -8254,7 +8341,7 @@ function renderPane() {
     h += `<label style="display:block;font-size:13px;margin-bottom:8px"><input type="checkbox" id="showIgn" ${S.opts.showIgnored ? 'checked' : ''}> Show warning seams on the map and in 3D</label>`;
     if (!ign.length) h += `<div class="empty">Every other border meets perfectly.</div>`;
     const canPatch = !W.landFromParent, holes = holeList(), ovf = ovfList(), wat = S.water || [], nx = patchExtras().length + fillList().length + ovfPicked().length + waterPicked().length;
-    if ((ign.length || holes.length || ovf.length || wat.length) && canPatch) h += `<div class="patchbox" style="font-size:12.5px">Want one fixed anyway? Tick <b>🛠</b> on a warning to add it to the seam patch.${nx ? ` <b>${nx} ticked.</b> <button class="primary small" id="mkPatch">🛠 Create a patch for ${patchLabel()}</button> <button class="small" id="pvPatchW">👁 Preview</button>` : ''}<div id="patchMsg"></div></div>`;
+    if ((ign.length || holes.length || ovf.length || wat.length) && canPatch) h += `<div class="patchbox" style="font-size:12.5px">Want one fixed anyway? Tick <b>🛠</b> on a warning to add it to the seam patch.${nx ? ` <b>${nx} ticked.</b> <button class="primary small" id="mkPatch">🛠 Create a patch for ${patchLabel()}</button> ${ptChip()} <button class="small" id="pvPatchW">👁 Preview</button>` : ''}<div id="patchMsg"></div></div>`;
     if (orderBad() && canPatch) h += `<div class="wgroup"><div class="whead" style="color:#ff6b6b"><span class="wdot" style="background:#ff6b6b"></span>Your seam patch needs rewriting</div><div class="muted" style="font-size:12px;margin:0 0 6px">${baseLost().length ? `An older version of this tool removed the <b>base texture</b> of ${baseLost().reduce((n, o) => n + o.quads.length, 0)} quarter(s) of cells in your seam patch and put the game's standard ground (dirt02) there. On paper the layers above still give the same ground, which is why it looked fine here, but in game such a quarter shows as a hard-edged square of dirt02. ` : ''}${S.holes.relaid ? `${S.holes.relaid} quarter(s) were rebuilt with another layer layout than the plugin under the patch; the game does not always draw a rebuilt quarter like the original, which can show as a square. ` : ''}${S.holes.edges ? `On ${S.holes.edges} point(s) of the lines between quarters (stored twice, once per quarter), the patch overwrote one quarter's copy with the other's, which shows as a stripe along the quarter's edge. ` : ''}${S.holes.order ? `${S.holes.order} cell(s) also have their texture data out of the usual order (harmless, tidied up too). ` : ''}Rewrite the patch: every rewritten quarter keeps its original layout and its original values wherever nothing was meant to change, and your seam fixes are kept.</div>${baseLost().map((o, i) => `<div class="item baseitem" data-bl="${i}" style="border-left:3px solid #ff6b6b"><div class="top"><b>▣ cell ${o.x},${o.y}</b><span class="muted">${o.quads.map(q => ['bottom-left', 'bottom-right', 'top-left', 'top-right'][q]).join(', ')} quarter${o.quads.length === 1 ? '' : 's'}</span></div><div class="sub">base texture removed · ${esc(P(o.from).name)} has one there</div></div>`).join('')}<button class="primary small" id="mkOrder">🛠 Rewrite my seam patch</button><div id="orderMsg"></div></div>`;
     if (holes.length) {
       const fk = new Set(fillList().map(f => f.x + ',' + f.y));
@@ -8351,7 +8438,7 @@ function renderPane() {
   const pvOn = S.pv && S.pv.w === W && V3.isOpen && patchList().length;
   if (pvOn) { const visible = patchList(); const sm = visible[Math.min(S.pv.i, visible.length - 1)]; h += `<div class="pvbar"><b>👁 Patch preview</b><button class="small" id="pvPrev" title="Previous seam">◀</button><span>seam ${Math.min(S.pv.i, visible.length - 1) + 1} / ${visible.length} · ${sm.a.x},${sm.a.y} ${sm.dir === 'E' ? '↔' : '↕'} ${sm.b.x},${sm.b.y}</span><button class="small" id="pvNext" title="Next seam">▶</button><button class="small" id="pvExit" style="margin-left:auto">Exit preview</button><div class="muted" style="flex-basis:100%;font-size:12px">Green marks show where each seam was. Click any seam below to jump to it with the patch applied.</div></div>`; }
   const plist = patchList();
-  if ((plist.length || terraEdits() || blendEdges().length || texStrokes().length || fillList().length || ovfPicked().length || waterPicked().length) && !W.landFromParent && TSI.buildSeamPatch) h += `<div class="patchbox"><button class="primary small" id="mkPatch" title="A small plugin that makes the ground and its textures meet at these borders. It only overrides the ground of those cells: your load order is not touched.">🛠 Create a patch for ${patchLabel()}</button>${plist.length ? ` <button class="small" id="pvPatch" title="Opens each border in 3D with the patch applied, so you see the result before creating anything">👁 Preview it in 3D</button>` : ''}<div class="muted" style="font-size:12px;margin-top:4px">Small or vanilla seams can be added too: tick them in the ⚠ Warnings tab.</div><div id="patchMsg">${S.patchMsg && S.patchMsg.w === W ? S.patchMsg.h : ''}</div></div>`;
+  if ((plist.length || terraEdits() || blendEdges().length || texStrokes().length || fillList().length || ovfPicked().length || waterPicked().length) && !W.landFromParent && TSI.buildSeamPatch) h += `<div class="patchbox"><button class="primary small" id="mkPatch" title="A small plugin that makes the ground and its textures meet at these borders. It only overrides the ground of those cells: your load order is not touched.">🛠 Create a patch for ${patchLabel()}</button> ${ptChip()}${plist.length ? ` <button class="small" id="pvPatch" title="Opens each border in 3D with the patch applied, so you see the result before creating anything">👁 Preview it in 3D</button>` : ''}<div class="muted" style="font-size:12px;margin-top:4px">Small or vanilla seams can be added too: tick them in the ⚠ Warnings tab.</div><div id="patchMsg">${S.patchMsg && S.patchMsg.w === W ? S.patchMsg.h : ''}</div></div>`;
   h += settingsHtml();
   if (!visible.length) h += `<div class="empty">No seams here. 🎉</div>`;
   if (ign.length) h += `<p class="muted" style="font-size:12.5px;margin:4px 0 10px">Plus ${ign.length} warning seam${ign.length === 1 ? '' : 's'} (vanilla, small, under water…): see <a href="#" id="toIgn">⚠ Warnings</a>.</p>`;
