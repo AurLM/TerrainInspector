@@ -157,6 +157,8 @@ a{color:var(--accent)}
 .mmbig.last:not(.on){border-style:dashed;border-color:#8a7440}
 .mmbig.on{border-color:var(--accent);background:#2a2214}.mmbig.on b{color:var(--accent)}
 #mmCard.picked{padding-top:12px;padding-bottom:12px}#mmCard.picked h2{font-size:14px;margin-bottom:8px}#mmCard.picked .mmbig{padding:10px;font-size:15px}#mmCard.picked .mmbig span{display:none}
+.dz{display:flex;gap:14px;align-items:center;border:2px dashed #e3a63c;border-radius:10px;background:#1e1a12;padding:14px 16px;margin:10px 0;transition:background .15s,border-color .15s}
+.dz.over{background:#2d2412;border-color:#ffd38a}.dz-ico{font-size:34px}.dz b{display:block;font-size:16px;color:#ffd38a;margin-bottom:2px}.dz span{font-size:13px;color:var(--dim)}.dz code{font-size:12px}
 .tipbox{background:#1d2230;border:1px solid #33405e;border-radius:6px;padding:8px 10px;font-size:13px}
 ol.howto{margin:4px 0 8px 18px;padding:0;line-height:1.9}
 details.paste{margin-top:10px}details.paste summary{cursor:pointer;color:var(--dim)}
@@ -274,11 +276,10 @@ details.paste{margin-top:10px}details.paste summary{cursor:pointer;color:var(--d
       <h2>Pick your plugins</h2>
       <p class="mm-vortex">Pick your game's <code>Data</code> folder, e.g. <code>C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Data</code>. Vortex puts every mod there, so that's all the tool needs (plus your load order in step 2).</p>
       <p class="mm-mo2" style="display:none"><span id="mmHow"></span> The tool finds the mods, the profile with its load order, and the game inside it. A checklist below shows what was found and what, if anything, is still needed.<br><span class="muted" style="font-size:12.5px">If something is stored elsewhere (game installed in Steam, mods in a shared folder), just add that folder too. You can add as many folders as you need, in any order.</span></p>
-      <p class="tipbox"><b>Browser says the folder "contains system files" or won't open it?</b> That happens with folders under <code>Program Files</code> or <code>AppData</code>. Open the folder in File Explorer and <b>drag it onto this page</b> instead: dragging always works.</p>
+      <div id="dropZone" class="dz"><div class="dz-ico">📂</div><div><b>Drag your folder here</b><span>Open it in File Explorer and drag it onto this box. Any folder works, including <code>C:\Program Files</code> and <code>AppData</code>: nothing to allow, nothing to install.</span></div></div>
       <div class="row">
         <button class="primary" id="pickDir">Pick a folder…</button>
         <button id="pickFiles">Pick plugin files…</button>
-        <span class="muted">or drag a folder / files here</span>
         <button id="clearBtn" class="small" style="display:none;margin-left:auto">Clear selection</button>
       </div>
       <input type="file" id="dirInput" webkitdirectory directory multiple hidden>
@@ -6627,41 +6628,55 @@ addEventListener('focus', () => {
 ['#dirInput', '#fileInput', '#loInput'].forEach(id => $(id).addEventListener('cancel', () => { pickPending = null; pickWait(false); }));
 /* Firefox has no "read only what's needed" folder picker: its folder button lists every file first, which
    freezes or crashes on big mod lists. There, the button opens a drop box instead (dragging is fast everywhere). */
-function openDropBox() {
+function openDropBox(reason) {
   let m = $('#dropBox');
   if (!m) {
     m = document.createElement('div'); m.id = 'dropBox';
     m.innerHTML = `<div class="db-card"><span class="db-x" title="Close">✕</span>
       <div class="db-zone"><div class="db-ico">📂</div><b>Drag your folder here</b>
         <div>Open File Explorer, then drag your <b>${document.querySelector('.mmbig.on[data-mm=mo2]') ? 'MO2 folder' : 'Data folder'}</b> onto this box.</div></div>
-      <p class="muted">Why? In Firefox, the folder button has to list every single file before the page can start, which freezes or crashes with big mod lists. Dragging only reads what's needed, so it works with any size.</p>
-      <a href="#" class="db-anyway">Use the folder button anyway (small folders only)</a></div>`;
+      <p class="muted db-why"></p>
+      <a href="#" class="db-anyway"></a></div>`;
     document.body.appendChild(m);
     m.querySelector('.db-x').onclick = () => m.style.display = 'none';
     m.querySelector('.db-anyway').onclick = e => { e.preventDefault(); m.style.display = 'none'; pickPending = 'folder'; $('#dirInput').click(); };
     m.addEventListener('drop', () => { m.style.display = 'none'; });
   }
   m.querySelector('b + div b').textContent = document.querySelector('.mmbig.on[data-mm=mo2]') ? 'MO2 folder' : 'Data folder';
+  m.querySelector('.db-why').innerHTML = reason === 'blocked'
+    ? 'Did the browser say the folder <b>"contains system files"</b>? It says that for every folder under <code>C:\\Program Files</code> and <code>AppData</code>, which is where Steam and MO2 put things. Dragging has no such limit, and nothing has to be installed or allowed.'
+    : 'Why? In Firefox, the folder button has to list every single file before the page can start, which freezes or crashes with big mod lists. Dragging only reads what\'s needed, so it works with any size.';
+  m.querySelector('.db-anyway').textContent = reason === 'blocked' ? 'Or use the classic folder window (also works there, slower with big mod lists)' : 'Use the folder button anyway (small folders only)';
   m.style.display = 'grid';
+}
+/* When the browser's picker gives nothing back. Some browser updates (Opera GX, late 2026) close the picker or refuse the
+   "let this site view files" step without saying so: the page then looked as if nothing had been picked. Say so, and offer the
+   two ways that don't go through that picker. Each needs a fresh click, which is why they are buttons, not automatic. */
+function pickTrouble(kind, err) {
+  const why = err && err.name && err.name !== 'AbortError' ? ` <span class="muted">(${esc(err.name)}${err.message ? ': ' + esc(err.message) : ''})</span>` : '';
+  setupMsg(err && err.name !== 'AbortError' ? 'error' : 'warn',
+    (err && err.name !== 'AbortError' ? `Your browser refused to hand over the ${kind}.${why}` : `Nothing came back from the picker.`) +
+    ` If you did choose ${kind === 'folder' ? 'a folder' : 'files'}, your browser blocked it. Either <b>drag the ${kind === 'folder' ? 'folder' : 'files'} onto this page</b>, or ` +
+    `<button class="small" id="pickClassic">use the classic picker</button>.`);
+  $('#pickClassic').onclick = () => { pickPending = kind === 'folder' ? 'folder' : 'files'; $(kind === 'folder' ? '#dirInput' : '#fileInput').click(); };
 }
 $('#pickDir').onclick = async () => {
   crumb('waiting for the browser to hand over the picked folder');
   if (!window.showDirectoryPicker) { openDropBox(); return; }
-  if (window.showDirectoryPicker) {
-    let h;
-    try { h = await window.showDirectoryPicker({ id: 'ti-data', mode: 'read' }); }
-    catch (e) { if (e && e.name === 'AbortError') return; pickPending = 'folder'; $('#dirInput').click(); return; }
-    S.handles.push(h);
-    addFolder(dirNode('fsa', h, h.name));
-    return;
+  let h;
+  try { h = await window.showDirectoryPicker({ id: 'ti-data', mode: 'read' }); }
+  catch (e) {
+    // Chrome, Edge, Opera… answer "contains system files" for anything under Program Files or AppData, then report it like a
+    // plain cancel. Either way the way in that always works is dragging, so offer it straight away.
+    if (!e || e.name === 'AbortError' || e.name === 'SecurityError' || e.name === 'NotAllowedError') { openDropBox('blocked'); return; }
+    pickTrouble('folder', e); return;
   }
-  pickPending = 'folder'; $('#dirInput').click();
+  if (!h) { openDropBox('blocked'); return; }
+  setupMsg();
+  S.handles.push(h);
+  try { await addFolder(dirNode('fsa', h, h.name)); }
+  catch (e) { setupMsg('error', `Couldn't read <b>${esc(h.name)}</b>: ${esc(e.message || String(e))}. Try dragging the folder onto this page instead.`); }
 };
-if (!window.showDirectoryPicker) {
-  const t = document.createElement('p'); t.className = 'tipbox';
-  t.innerHTML = '<b>Big mod list?</b> In this browser, the folder button has to list every file first, which can freeze it with thousands of mods. <b>Drag the folder onto this page instead</b>: it only reads what is needed and works with any size.';
-  const tb = document.querySelector('.tipbox'); if (tb) tb.after(t);
-}
 $('#pickFiles').onclick = () => { pickPending = 'files'; $('#fileInput').click(); };
 // a plain file box on purpose: the newer picker refuses anything under AppData, which is exactly where plugins.txt lives
 $('#pickLO').onclick = () => $('#loInput').click();
@@ -6698,11 +6713,24 @@ async function offerReopen() {
 }
 offerReopen();
 $('#clearBtn').onclick = () => { S.handles = []; S.loHandles = []; S.looseCands = new Map(); S.bsaCands = []; S.lazySources = []; S.files = new Map(); S.headers = new Map(); S.cands = new Map(); S.profiles = new Map(); S.profile = null; S.modlist = null; S.modlistName = ''; S.dupInfo = null; S.loText = null; S.loName = ''; $('#loName').textContent = ''; renderProfiles(); setupMsg(); refreshSetup(); };
-$('#dirInput').onchange = e => { const fl = [...e.target.files]; e.target.value = ''; pickPending = null; pickWait(false); addFiles(fl, 'folder'); };
-$('#fileInput').onchange = e => { const fl = [...e.target.files]; e.target.value = ''; pickPending = null; pickWait(false); addFiles(fl, 'files'); };
+/* Read a file box once it holds files. Both 'change' and 'input' are listened to, and the box is checked again when the
+   window gets focus back: some browser builds stopped sending one of the two events. */
+function takeInput(el, how) {
+  const fl = [...(el.files || [])]; if (!fl.length) return false;
+  el.value = ''; pickPending = null; pickWait(false); setupMsg();
+  Promise.resolve().then(() => addFiles(fl, how)).catch(e => setupMsg('error', `Couldn't read the picked ${how}: ${esc(e.message || String(e))}`));
+  return true;
+}
+for (const [id, how] of [['#dirInput', 'folder'], ['#fileInput', 'files']]) { const el = $(id); el.onchange = () => takeInput(el, how); el.oninput = () => takeInput(el, how); }
+addEventListener('focus', () => {
+  if (!pickPending) return; const kind = pickPending, el = $(kind === 'folder' ? '#dirInput' : '#fileInput');
+  setTimeout(() => { if (pickPending === kind) takeInput(el, kind); }, 1200);
+  // still nothing after a long wait, and no files in the box: the browser dropped the selection
+  setTimeout(() => { if (pickPending === kind && !(el.files && el.files.length)) { pickPending = null; pickWait(false); pickTrouble(kind, null); } }, kind === 'folder' ? 240000 : 8000);
+});
 $('#loInput').onchange = e => { const fl = [...e.target.files]; e.target.value = ''; if (fl.length) setLO(fl); };
 const MM_HOW = {
-  mo2: '<b>Pick your MO2 folder</b>: the one that contains <code>mods</code> and <code>profiles</code> (for a portable MO2, the folder with <code>ModOrganizer.exe</code>).',
+  mo2: '<b>Pick your MO2 folder</b>: the one that contains <code>mods</code> and <code>profiles</code> (for a portable MO2, the folder with <code>ModOrganizer.exe</code>; otherwise it is in <code>%LOCALAPPDATA%\\ModOrganizer</code>, one folder per instance).',
   wabbajack: '<b>Pick the folder where Wabbajack installed your list</b>: the one with <code>ModOrganizer.exe</code>, <code>mods</code>, <code>profiles</code> and usually <code>Stock Game</code> or <code>Game Root</code>.',
   nolvus: '<b>Pick your Nolvus instance folder</b>: the one that contains <code>MODS</code>, <code>STOCK GAME</code> and <code>MO2</code>, usually <code>…\\Nolvus\\Instances\\Nolvus Ascension</code>. The main <code>Nolvus</code> folder works too.'
 };
@@ -6931,11 +6959,11 @@ async function filesFromDrop(dt) {
   return { files: out, folder: true };
 }
 let dragDepth = 0;
-addEventListener('dragenter', e => { e.preventDefault(); if (++dragDepth === 1 && !S.ctx) $('#drop').style.display = 'grid'; });
-addEventListener('dragleave', e => { if (--dragDepth <= 0) { dragDepth = 0; $('#drop').style.display = 'none'; } });
+addEventListener('dragenter', e => { e.preventDefault(); if (++dragDepth === 1 && !S.ctx) { $('#drop').style.display = 'grid'; $('#dropZone').classList.add('over'); } });
+addEventListener('dragleave', e => { if (--dragDepth <= 0) { dragDepth = 0; $('#drop').style.display = 'none'; $('#dropZone').classList.remove('over'); } });
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', async e => {
-  e.preventDefault(); dragDepth = 0; $('#drop').style.display = 'none';
+  e.preventDefault(); dragDepth = 0; $('#drop').style.display = 'none'; $('#dropZone').classList.remove('over');
   const db = $('#dropBox'); if (db) db.style.display = 'none';
   if (S.ctx) return;
   const entries = [...e.dataTransfer.items || []].map(it => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);

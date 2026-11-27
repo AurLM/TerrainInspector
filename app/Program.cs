@@ -1,6 +1,9 @@
-// Terrain Inspector for Windows: shows the tool (terrain-inspector.html, built into this .exe) in its own window,
-// using Microsoft Edge WebView2, which is part of Windows 10 and 11. Nothing goes to the internet:
-// the page is handed to the window straight from inside the program, under a made-up local address.
+// Terrain Inspector for Windows: shows the tool in its own window, using Microsoft Edge WebView2 (part of Windows 10 and 11).
+//
+// Built to be plain and easy to check:
+//  - nothing is packed inside this .exe: the tool is the file page\terrain-inspector.html next to it, readable by anyone;
+//  - no installer, no extraction, no admin rights, no registry, no internet connection;
+//  - the only folder it writes to is its own settings folder, %LOCALAPPDATA%\TerrainInspector.
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -24,7 +27,7 @@ namespace TerrainInspector
 
     sealed class MainForm : Form
     {
-        const string Host = "terrain-inspector.example";      // never leaves this PC
+        const string Host = "terrain-inspector.example";      // a made-up name, only ever answered inside this window
         const string Page = "terrain-inspector.html";
         readonly WebView2 web = new WebView2 { Dock = DockStyle.Fill };
 
@@ -41,45 +44,42 @@ namespace TerrainInspector
 
         async Task Start()
         {
-            byte[] html;
-            using (var res = typeof(MainForm).Assembly.GetManifestResourceStream(Page))
+            string pageDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "page");
+            if (!File.Exists(Path.Combine(pageDir, Page)))
             {
-                if (res == null) { MessageBox.Show("This build of Terrain Inspector is incomplete (the tool page is missing inside it).", "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error); Close(); return; }
-                using (var ms = new MemoryStream()) { res.CopyTo(ms); html = ms.ToArray(); }
+                MessageBox.Show("The file page\\" + Page + " is missing next to Terrain Inspector.exe.\n\nUnzip the whole Terrain Inspector folder and run the program from it.",
+                    "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Close(); return;
             }
             try
             {
-                // settings and remembered folders are kept in the user's AppData, so the program also works from a read-only folder
+                // settings and remembered folders go to the user's AppData, so the program also runs from a read-only folder
                 string data = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TerrainInspector", "WebView2");
                 var env = await CoreWebView2Environment.CreateAsync(null, data);
                 await web.EnsureCoreWebView2Async(env);
             }
             catch (WebView2RuntimeNotFoundException)
             {
-                var r = MessageBox.Show("Terrain Inspector needs the Microsoft Edge WebView2 Runtime, which is part of Windows 10 and 11 but missing on this PC.\n\nOpen Microsoft's download page now?",
-                    "Terrain Inspector", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
-                if (r == DialogResult.Yes) OpenOutside("https://developer.microsoft.com/microsoft-edge/webview2/");
+                MessageBox.Show("Terrain Inspector needs the Microsoft Edge WebView2 Runtime. It is part of Windows 10 and 11, but it is missing or turned off on this PC.\n\n" +
+                    "You can get it from Microsoft (search for \"WebView2 Runtime\"), or open page\\" + Page + " in your browser instead: it is the same tool.",
+                    "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 Close(); return;
             }
             catch (Exception ex)
             {
-                MessageBox.Show("Terrain Inspector could not start its window:\n\n" + ex.Message, "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("Terrain Inspector couldn't start its window:\n\n" + ex.Message + "\n\nYou can open page\\" + Page + " in your browser instead: it is the same tool.",
+                    "Terrain Inspector", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Close(); return;
             }
 
             var cw = web.CoreWebView2;
-            // every request to the local address gets the page from inside the program
-            cw.AddWebResourceRequestedFilter($"https://{Host}/*", CoreWebView2WebResourceContext.All);
-            cw.WebResourceRequested += (s, e) =>
-            {
-                var path = new Uri(e.Request.Uri).AbsolutePath;
-                e.Response = path == "/" || path == "/" + Page
-                    ? cw.Environment.CreateWebResourceResponse(new MemoryStream(html), 200, "OK", "Content-Type: text/html; charset=utf-8")
-                    : cw.Environment.CreateWebResourceResponse(null, 404, "Not Found", "");
-            };
+            // the page folder is shown under the made-up address; nothing else on the PC is reachable that way
+            cw.SetVirtualHostNameToFolderMapping(Host, pageDir, CoreWebView2HostResourceAccessKind.DenyCors);
             cw.Settings.IsStatusBarEnabled = false;
             cw.Settings.AreDefaultContextMenusEnabled = true;
-            // links to Nexus, GitHub, etc. open in the normal browser, not inside the tool
+            cw.Settings.IsPasswordAutosaveEnabled = false;
+            cw.Settings.IsGeneralAutofillEnabled = false;
+            // links (Nexus, GitHub…) open in the normal browser; the window itself only ever shows the tool
             cw.NewWindowRequested += (s, e) => { e.Handled = true; OpenOutside(e.Uri); };
             cw.NavigationStarting += (s, e) =>
             {
@@ -87,12 +87,14 @@ namespace TerrainInspector
                 { e.Cancel = true; OpenOutside(e.Uri); }
             };
             cw.DocumentTitleChanged += (s, e) => { var t = cw.DocumentTitle; Text = string.IsNullOrWhiteSpace(t) ? "Terrain Inspector" : t; };
-            cw.Navigate($"https://{Host}/{Page}");
+            cw.Navigate("https://" + Host + "/" + Page);
         }
 
         static void OpenOutside(string url)
         {
-            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { }
+            // only web links, handed to the user's default browser
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var u) || (u.Scheme != "http" && u.Scheme != "https")) return;
+            try { Process.Start(new ProcessStartInfo(u.AbsoluteUri) { UseShellExecute = true }); } catch { }
         }
     }
 }

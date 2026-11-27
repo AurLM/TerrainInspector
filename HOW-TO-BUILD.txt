@@ -1,15 +1,25 @@
-TERRAIN INSPECTOR - WINDOWS .EXE (built by GitHub)
+TERRAIN INSPECTOR - WINDOWS VERSION, BUILT BY GITHUB
 
-Put these in your GitHub repository, keeping the folders:
+In your GitHub repository (the one that built the previous .exe), replace everything with the files of this zip,
+keeping the folders:
   .github/workflows/build-windows-exe.yml
-  app/TerrainInspector.csproj
   app/Program.cs
-  terrain-inspector.html          <- replace it with each new version of the tool (it is built INTO the .exe)
-  README.txt                      <- optional, copied next to the .exe
+  app/TerrainInspector.csproj
+  app/app.manifest
+  terrain-inspector.html      <- the tool, replace it with each new version
+  VERSION.txt                 <- just the version number, e.g. 2.5
+  README.txt                  <- goes into the folder users get
 
-Every push builds it. Then: Actions tab > latest "Build Windows exe" run > Artifacts > Terrain-Inspector-windows.
-That zip is the folder to upload to Nexus. Users unzip it and double-click "Terrain Inspector.exe".
-Keep the whole folder together: the .exe needs the .dll files next to it. The HTML is inside the .exe, users never see it.
+Push (or on github.com: Add file > Upload files > Commit changes). About 3 minutes later:
+Actions tab > latest "Build Windows exe" run > Artifacts > "Terrain Inspector 2.5".
+Upload that zip to Nexus AS IT IS. Don't unzip and re-pack it, don't add other files, and use ZIP (not RAR).
 
-Users need nothing installed: .NET Framework 4.8 and the Edge WebView2 Runtime are part of Windows 10 and 11.
-Settings and remembered folders are stored in %LOCALAPPDATA%\TerrainInspector.
+What changed from the previous .exe, and why:
+- The tool page is no longer packed INSIDE the .exe. It is page\terrain-inspector.html next to it.
+  An .exe that carries another file inside it and hands it out at run time looks like a self-extracting
+  file, which Nexus sends to manual review. Now the .exe is small and only opens a window.
+- Nexus's scanner can now preview every file in the zip (it can't look inside an .exe).
+- Full version details (name, author, version, description) in the .exe's properties.
+- Declares that it never needs admin rights and supports Windows 10/11.
+- No internet code: if WebView2 is missing, it just says so (no download link opened from the program).
+- The build checks there is one small .exe, no archive inside the folder, and every needed file.

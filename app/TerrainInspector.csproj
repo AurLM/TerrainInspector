@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- A small Windows window around terrain-inspector.html, which is built INTO the .exe (users never see the HTML).
-       .NET Framework 4.8 is built into Windows 10 and 11, so users install nothing for it. -->
+  <!-- A small Windows window around page\terrain-inspector.html, which stays a separate, readable file next to the .exe.
+       .NET Framework 4.8 is part of Windows 10 and 11, so users install nothing. -->
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net48</TargetFramework>
@@ -8,14 +8,25 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>Terrain Inspector</AssemblyName>
     <RootNamespace>TerrainInspector</RootNamespace>
-    <Product>Terrain Inspector</Product>
-    <Description>Finds and fixes terrain seams in a Skyrim load order.</Description>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <DebugType>none</DebugType>
+    <Deterministic>true</Deterministic>
+    <Optimize>true</Optimize>
+    <!-- full version details in the file's properties (set by the build from VERSION.txt) -->
+    <TIVersion Condition="'$(TIVersion)' == ''">1.0.0</TIVersion>
+    <Version>$(TIVersion)</Version>
+    <FileVersion>$(TIVersion)</FileVersion>
+    <InformationalVersion>$(TIVersion)</InformationalVersion>
+    <Product>Terrain Inspector</Product>
+    <AssemblyTitle>Terrain Inspector</AssemblyTitle>
+    <Description>Terrain Inspector - finds and fixes terrain seams in a Skyrim SE/AE load order</Description>
+    <Company>AurLMen</Company>
+    <Authors>AurLMen</Authors>
+    <Copyright>AurLMen</Copyright>
+    <NeutralLanguage>en</NeutralLanguage>
   </PropertyGroup>
   <ItemGroup>
-    <!-- the tool itself, taken from the root of the repository at build time -->
-    <EmbeddedResource Include="..\terrain-inspector.html" LogicalName="terrain-inspector.html" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4314.35" />
